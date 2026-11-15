@@ -22,21 +22,21 @@
 
 """
 
-from collections import defaultdict, deque
-from enum import Enum, IntEnum
 import os
 import subprocess
 import threading
 import time
+from collections import defaultdict, deque
+from contextlib import ExitStack
+from enum import Enum, IntEnum
 
 import msgpack
 import numpy as np
-from scipy.spatial.transform import Rotation as R, Rotation as sRot
 import torch
 import zmq
+from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation as sRot
 
-from gear_sonic.utils.teleop import input_readers
-from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
     angle_axis_to_quaternion,
@@ -46,6 +46,9 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_angle_axis,
     quaternion_to_rotation_matrix,
 )
+from gear_sonic.utils.teleop import input_readers
+from gear_sonic.utils.teleop.keyboard_input import KeyboardControlSource
+from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 
 try:
     from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -614,8 +617,17 @@ def init_hand_ik_solvers():
 _ISAAC_TELEOP_READERS = (input_readers.IsaacTeleopReader,)
 
 
-def get_controller_inputs(reader=None):
+def get_controller_inputs(reader=None, keyboard=None):
     """Fetch controller button/trigger states from XRoboToolkit or IsaacCapture."""
+    if keyboard is not None:
+        ctrl = keyboard.get_controller_data()
+        return (
+            bool(ctrl.get("left_menu_button", False)),
+            float(ctrl.get("left_trigger_value", 0.0)),
+            float(ctrl.get("right_trigger_value", 0.0)),
+            float(ctrl.get("left_squeeze_value", 0.0)),
+            float(ctrl.get("right_squeeze_value", 0.0)),
+        )
     if isinstance(reader, _ISAAC_TELEOP_READERS):
         ctrl = reader.get_controller_data()
         if ctrl is None:
@@ -635,8 +647,10 @@ def get_controller_inputs(reader=None):
     return left_menu_button, left_trigger, right_trigger, left_grip, right_grip
 
 
-def get_controller_axes(reader=None):
+def get_controller_axes(reader=None, keyboard=None):
     """Fetch joystick axes (lx, ly, rx, ry). Falls back to zeros if not available."""
+    if keyboard is not None:
+        return 0.0, 0.0, 0.0, 0.0
     if isinstance(reader, _ISAAC_TELEOP_READERS):
         ctrl = reader.get_controller_data()
         if ctrl is None:
@@ -663,8 +677,11 @@ def get_controller_axes(reader=None):
         return 0.0, 0.0, 0.0, 0.0
 
 
-def get_menu_buttons(reader=None):
+def get_menu_buttons(reader=None, keyboard=None):
     """Fetch both menu buttons (left, right). Falls back to False if not available."""
+    if keyboard is not None:
+        ctrl = keyboard.get_controller_data()
+        return bool(ctrl.get("left_menu_button", False)), False
     if isinstance(reader, _ISAAC_TELEOP_READERS):
         return False, False
     if xrt is None:
@@ -682,8 +699,14 @@ def get_menu_buttons(reader=None):
     return left, right
 
 
-def get_axis_clicks(reader=None):
+def get_axis_clicks(reader=None, keyboard=None):
     """Fetch both axis click buttons (left, right). Falls back to False if not available."""
+    if keyboard is not None:
+        ctrl = keyboard.get_controller_data()
+        return (
+            float(ctrl.get("left_thumbstick_click", 0.0)) > 0.5,
+            float(ctrl.get("right_thumbstick_click", 0.0)) > 0.5,
+        )
     if isinstance(reader, _ISAAC_TELEOP_READERS):
         ctrl = reader.get_controller_data()
         if ctrl is None:
@@ -707,8 +730,14 @@ def get_axis_clicks(reader=None):
     return left, right
 
 
-def get_face_buttons(reader=None):
+def get_face_buttons(reader=None, keyboard=None):
     """Fetch primary face buttons A and X. Returns (a_pressed, x_pressed)."""
+    if keyboard is not None:
+        ctrl = keyboard.get_controller_data()
+        return (
+            float(ctrl.get("right_primary_click", 0.0)) > 0.5,
+            float(ctrl.get("left_primary_click", 0.0)) > 0.5,
+        )
     if isinstance(reader, _ISAAC_TELEOP_READERS):
         ctrl = reader.get_controller_data()
         if ctrl is None:
@@ -727,8 +756,16 @@ def get_face_buttons(reader=None):
         return False, False
 
 
-def get_abxy_buttons(reader=None):
+def get_abxy_buttons(reader=None, keyboard=None):
     """Fetch A,B,X,Y face buttons as booleans (a,b,x,y)."""
+    if keyboard is not None:
+        ctrl = keyboard.get_controller_data()
+        return (
+            float(ctrl.get("right_primary_click", 0.0)) > 0.5,
+            float(ctrl.get("right_secondary_click", 0.0)) > 0.5,
+            float(ctrl.get("left_primary_click", 0.0)) > 0.5,
+            float(ctrl.get("left_secondary_click", 0.0)) > 0.5,
+        )
     if isinstance(reader, _ISAAC_TELEOP_READERS):
         ctrl = reader.get_controller_data()
         if ctrl is None:
@@ -1249,9 +1286,11 @@ class PoseStreamer:
         record_dir: str,
         record_format: str,
         log_prefix: str = "PoseLoop",
+        keyboard=None,
     ):
         self.socket = socket
         self.reader = reader
+        self.keyboard = keyboard
         self.num_frames_to_send = num_frames_to_send
         self.target_fps = target_fps
         self.record_dir = record_dir
@@ -1349,10 +1388,12 @@ class PoseStreamer:
             self.parent_indices, self.device, sample["body_poses_np"]
         )
         left_menu_button, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(
-            self.reader
+            self.reader, keyboard=self.keyboard
         )
         # Get A and B button states for data collection control
-        a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(self.reader)
+        a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(
+            self.reader, keyboard=self.keyboard
+        )
 
         # Data collection toggle logic (edge-triggered)
         # Left grip + A = toggle_data_collection
@@ -1503,7 +1544,7 @@ class PoseStreamer:
             self.buffer_cleared = False
 
         # Get joystick axes for yaw accumulation
-        _, _, rx, _ = get_controller_axes(self.reader)
+        _, _, rx, _ = get_controller_axes(self.reader, keyboard=self.keyboard)
         self.yaw_accumulator.update(rx, self.frame_time)
 
         # Only send if buffer is full and we're not waiting for fresh data
@@ -1596,6 +1637,13 @@ def _init_input_source(
     return reader
 
 
+def _close_xrt_sdk(input_source: str) -> None:
+    if input_source == "xrt":
+        if xrt is None:
+            raise RuntimeError("XRoboToolkit SDK disappeared before shutdown")
+        xrt.close()
+
+
 def run_pico(
     buffer_size: int = 15,
     port: int = 5556,
@@ -1641,8 +1689,10 @@ def run_pico(
             reader=reader,
         )
     finally:
-        socket.close()
-        context.term()
+        with ExitStack() as cleanup:
+            cleanup.callback(context.term)
+            cleanup.callback(socket.close)
+            cleanup.callback(_close_xrt_sdk, input_source)
         print("Threads stopped, ZMQ socket closed")
 
 
@@ -1722,9 +1772,11 @@ class PlannerStreamer:
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
+        keyboard=None,
     ):
         self.socket = socket
         self.reader = reader
+        self.keyboard = keyboard
         self.three_point = three_point
         self.feedback_reader = FeedbackReader(
             zmq_feedback_host=zmq_feedback_host, zmq_feedback_port=zmq_feedback_port
@@ -1781,7 +1833,9 @@ class PlannerStreamer:
             self.last_xrt_timestamp = xrt_timestamp
 
             # A+B => next mode; X+Y => previous mode (rising edges)
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(self.reader)
+            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(
+                self.reader, keyboard=self.keyboard
+            )
             ab_now = bool(a_pressed) and bool(b_pressed)
             xy_now = bool(x_pressed) and bool(y_pressed)
             if ab_now and not self.prev_ab:
@@ -1794,7 +1848,7 @@ class PlannerStreamer:
             self.prev_xy = xy_now
 
             # Read axes/joysticks to control movement, facing, speed and mode
-            lx, ly, rx, ry = get_controller_axes(self.reader)
+            lx, ly, rx, ry = get_controller_axes(self.reader, keyboard=self.keyboard)
 
             # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
             facing = self.yaw_accumulator.update(rx, self.dt)
@@ -1856,7 +1910,7 @@ class PlannerStreamer:
                     right_trigger,
                     left_grip,
                     right_grip,
-                ) = get_controller_inputs(self.reader)
+                ) = get_controller_inputs(self.reader, keyboard=self.keyboard)
                 lh_joints, rh_joints = compute_hand_joints_from_inputs(
                     self.left_hand_ik_solver,
                     self.right_hand_ik_solver,
@@ -1912,6 +1966,28 @@ def run_pico_manager(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    control_source: str = "controller",
+    keyboard_ttl_sec: float = 0.32,
+    keyboard_a: str = "a",
+    keyboard_b: str = "b",
+    keyboard_x: str = "x",
+    keyboard_y: str = "y",
+    keyboard_grip: str = "g",
+    keyboard_start_stop: str = "s",
+    keyboard_mode: str = "m",
+    keyboard_frozen_mode: str = "f",
+    keyboard_record: str = "c",
+    keyboard_discard: str = "d",
+    keyboard_menu: str = "p",
+    keyboard_axis_click: str = "v",
+    revo2_trigger: bool = False,
+    revo2_devices: str | None = None,
+    revo2_deadman_s: float = 0.3,
+    revo2_slew_per_s: float = 0.4,
+    revo2_command_period_s: float = 0.04,
+    revo2_thumb_delta: float = 0.15,
+    revo2_finger_delta: float = 0.20,
+    revo2_command_speed: float = 0.25,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1919,7 +1995,37 @@ def run_pico_manager(
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
     """
+    if control_source not in {"controller", "keyboard"}:
+        raise ValueError("control_source must be 'controller' or 'keyboard'")
+    if revo2_trigger and not revo2_devices:
+        raise ValueError("revo2_devices is required when Revo2 Trigger output is enabled")
     reader = _init_input_source(input_source, buffer_size)
+    keyboard = None
+    if control_source == "keyboard":
+        keyboard = KeyboardControlSource(
+            ttl_sec=keyboard_ttl_sec,
+            key_mapping={
+                "a": keyboard_a,
+                "b": keyboard_b,
+                "x": keyboard_x,
+                "y": keyboard_y,
+                "grip": keyboard_grip,
+            },
+            action_mapping={
+                "start_stop": keyboard_start_stop,
+                "mode": keyboard_mode,
+                "frozen_mode": keyboard_frozen_mode,
+                "record": keyboard_record,
+                "discard": keyboard_discard,
+                "menu": keyboard_menu,
+                "axis_click": keyboard_axis_click,
+            },
+        )
+        try:
+            keyboard.start()
+        except Exception:
+            reader.stop()
+            raise
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -1953,6 +2059,7 @@ def run_pico_manager(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix="PoseLoop",
+        keyboard=keyboard,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -1961,6 +2068,7 @@ def run_pico_manager(
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
+        keyboard=keyboard,
     )
 
     # State machine diagram:
@@ -1985,18 +2093,85 @@ def run_pico_manager(
     vr3pt_parent_mode = StreamMode.PLANNER
     prev_toggle_dc = False
     prev_toggle_da = False
+    revo2_output = None
+    revo2_last_source_timestamp_ns = 0
+
+    def submit_revo2_target(left_trigger: float, right_trigger: float) -> bool:
+        nonlocal revo2_last_source_timestamp_ns
+        if revo2_output is None:
+            return False
+        sample = reader.get_latest()
+        if sample is None:
+            return False
+        source_timestamp_ns = int(sample.get("timestamp_ns", 0))
+        if source_timestamp_ns <= revo2_last_source_timestamp_ns:
+            return revo2_last_source_timestamp_ns > 0
+        source_received_monotonic_ns = int(
+            float(sample.get("timestamp_monotonic", time.monotonic())) * 1e9
+        )
+        source_age_ns = time.monotonic_ns() - source_received_monotonic_ns
+        if not 0 <= source_age_ns <= int(revo2_deadman_s * 1e9):
+            return False
+        revo2_output.submit_triggers(
+            left_trigger,
+            right_trigger,
+            source_received_monotonic_ns=source_received_monotonic_ns,
+        )
+        revo2_last_source_timestamp_ns = source_timestamp_ns
+        return True
+
     try:
+        if revo2_trigger:
+            from gear_sonic.utils.teleop.revo2_trigger import (
+                Revo2TriggerOutput,
+                load_revo2_devices,
+            )
+
+            devices = load_revo2_devices(revo2_devices)
+            revo2_output = Revo2TriggerOutput(
+                devices,
+                deadman_s=revo2_deadman_s,
+                slew_per_s=revo2_slew_per_s,
+                command_period_s=revo2_command_period_s,
+                thumb_delta=revo2_thumb_delta,
+                finger_delta=revo2_finger_delta,
+                command_speed=revo2_command_speed,
+            )
+            revo2_output.start()
+            print(
+                "[Manager] Revo2 Trigger output ready; "
+                f"startup-relative thumb_delta={revo2_thumb_delta:.3f}, "
+                f"finger_delta={revo2_finger_delta:.3f}"
+            )
+
         prev_ax_pressed = False
         prev_by_pressed = False
         prev_start_combo = False
         prev_left_axis_click = False
         while True:
-            # Poll Pico controller for buttons/axes
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
+            if revo2_output is not None:
+                revo2_output.check_health()
 
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs(reader)
+            # Mode/state controls may come from the PICO controller or keyboard.
+            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(
+                reader, keyboard=keyboard
+            )
 
-            left_axis_click, _ = get_axis_clicks(reader)
+            (
+                left_menu_button,
+                _,
+                _,
+                left_grip_mgr,
+                _,
+            ) = get_controller_inputs(reader, keyboard=keyboard)
+
+            # Revo2 always follows the physical PICO Triggers.  In keyboard
+            # mode the keyboard adapter intentionally reports zero triggers.
+            _, left_trigger, right_trigger, _, _ = get_controller_inputs(
+                reader, keyboard=None
+            )
+
+            left_axis_click, _ = get_axis_clicks(reader, keyboard=keyboard)
 
             # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
             ax_pressed = (a_pressed) and (x_pressed)
@@ -2109,9 +2284,17 @@ def run_pico_manager(
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
             if new_mode != current_mode:
                 if new_mode == StreamMode.OFF:
+                    if revo2_output is not None:
+                        revo2_output.set_enabled(False)
                     socket.send(build_command_message(start=False, stop=True, planner=True))
                     exit()
-                elif (
+
+                if revo2_output is not None:
+                    if not submit_revo2_target(left_trigger, right_trigger):
+                        raise RuntimeError("cannot enable Revo2 without fresh XR input")
+                    revo2_output.set_enabled(True)
+
+                if (
                     new_mode == StreamMode.PLANNER
                     or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
                     or new_mode == StreamMode.PLANNER_VR_3PT
@@ -2122,6 +2305,9 @@ def run_pico_manager(
 
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
+
+            if revo2_output is not None and current_mode != StreamMode.OFF:
+                submit_revo2_target(left_trigger, right_trigger)
 
             # Mode-independent: send manager_state for data exporter
             toggle_dc_tmp = bool(a_pressed) and left_grip_mgr > 0.5
@@ -2149,12 +2335,19 @@ def run_pico_manager(
     except KeyboardInterrupt:
         print("\nStopping manager...")
     finally:
-        # Cleanup resources
-        reader.stop()
-        three_point.close()
-        socket.close()
-        context.term()
-        print("[Manager] Shutdown complete")
+        try:
+            with ExitStack() as cleanup:
+                cleanup.callback(context.term)
+                cleanup.callback(socket.close)
+                cleanup.callback(three_point.close)
+                cleanup.callback(_close_xrt_sdk, input_source)
+                if keyboard is not None:
+                    cleanup.callback(keyboard.stop)
+                cleanup.callback(reader.stop)
+                if revo2_output is not None:
+                    cleanup.callback(revo2_output.close)
+        finally:
+            print("[Manager] Shutdown complete")
 
 
 if __name__ == "__main__":
@@ -2251,7 +2444,73 @@ if __name__ == "__main__":
             "'isaac-teleop' for in-process IsaacCapture / CloudXR DeviceIO"
         ),
     )
+    parser.add_argument(
+        "--control-source",
+        type=str,
+        default="controller",
+        choices=["controller", "keyboard"],
+        help=(
+            "Control buttons: 'controller' preserves the PICO ABXY/grip path; "
+            "'keyboard' replaces those buttons while keeping the same manager protocol"
+        ),
+    )
+    parser.add_argument(
+        "--keyboard-ttl-sec",
+        type=float,
+        default=0.32,
+        help="How long a terminal key press remains active for chord detection",
+    )
+    parser.add_argument("--keyboard-a", type=str, default="a", help="Keyboard key mapped to A")
+    parser.add_argument("--keyboard-b", type=str, default="b", help="Keyboard key mapped to B")
+    parser.add_argument("--keyboard-x", type=str, default="x", help="Keyboard key mapped to X")
+    parser.add_argument("--keyboard-y", type=str, default="y", help="Keyboard key mapped to Y")
+    parser.add_argument(
+        "--keyboard-grip", type=str, default="g", help="Keyboard key mapped to left Grip"
+    )
+    parser.add_argument(
+        "--keyboard-start-stop", type=str, default="s", help="Atomic A+B+X+Y action key"
+    )
+    parser.add_argument("--keyboard-mode", type=str, default="m", help="Atomic A+X action key")
+    parser.add_argument(
+        "--keyboard-frozen-mode", type=str, default="f", help="Atomic B+Y action key"
+    )
+    parser.add_argument(
+        "--keyboard-record", type=str, default="c", help="Atomic left Grip+A action key"
+    )
+    parser.add_argument(
+        "--keyboard-discard", type=str, default="d", help="Atomic left Grip+B action key"
+    )
+    parser.add_argument(
+        "--keyboard-menu", type=str, default="p", help="Keyboard key mapped to left Menu/Pause"
+    )
+    parser.add_argument(
+        "--keyboard-axis-click",
+        type=str,
+        default="v",
+        help="Keyboard key mapped to left thumbstick click",
+    )
+    parser.add_argument(
+        "--revo2-trigger",
+        action="store_true",
+        help="Linearly map each PICO Trigger to all six channels of its Revo2 hand",
+    )
+    parser.add_argument(
+        "--revo2-devices",
+        type=str,
+        help="JSON file containing verified left/right Revo2 port, serial, and slave_id",
+    )
+    parser.add_argument("--revo2-deadman-s", type=float, default=0.3)
+    parser.add_argument("--revo2-slew-per-s", type=float, default=0.4)
+    parser.add_argument("--revo2-command-period-s", type=float, default=0.04)
+    parser.add_argument("--revo2-thumb-delta", type=float, default=0.15)
+    parser.add_argument("--revo2-finger-delta", type=float, default=0.20)
+    parser.add_argument("--revo2-command-speed", type=float, default=0.25)
     args = parser.parse_args()
+
+    if args.revo2_trigger and not args.manager:
+        parser.error("--revo2-trigger requires --manager")
+    if args.revo2_trigger and not args.revo2_devices:
+        parser.error("--revo2-trigger requires --revo2-devices")
 
     # Standalone VR3Pt test modes (exit after finishing)
     if args.vr3pt_test:
@@ -2292,6 +2551,28 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            control_source=args.control_source,
+            keyboard_ttl_sec=args.keyboard_ttl_sec,
+            keyboard_a=args.keyboard_a,
+            keyboard_b=args.keyboard_b,
+            keyboard_x=args.keyboard_x,
+            keyboard_y=args.keyboard_y,
+            keyboard_grip=args.keyboard_grip,
+            keyboard_start_stop=args.keyboard_start_stop,
+            keyboard_mode=args.keyboard_mode,
+            keyboard_frozen_mode=args.keyboard_frozen_mode,
+            keyboard_record=args.keyboard_record,
+            keyboard_discard=args.keyboard_discard,
+            keyboard_menu=args.keyboard_menu,
+            keyboard_axis_click=args.keyboard_axis_click,
+            revo2_trigger=args.revo2_trigger,
+            revo2_devices=args.revo2_devices,
+            revo2_deadman_s=args.revo2_deadman_s,
+            revo2_slew_per_s=args.revo2_slew_per_s,
+            revo2_command_period_s=args.revo2_command_period_s,
+            revo2_thumb_delta=args.revo2_thumb_delta,
+            revo2_finger_delta=args.revo2_finger_delta,
+            revo2_command_speed=args.revo2_command_speed,
         )
     else:
         # Run legacy single-thread pose streaming
