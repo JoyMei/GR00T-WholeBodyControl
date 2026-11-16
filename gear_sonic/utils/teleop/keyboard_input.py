@@ -150,6 +150,7 @@ class KeyboardControlSource:
             "right_thumbstick": [0.0, 0.0],
             "left_thumbstick_click": 1.0 if self._pressed("axis_click", now) else 0.0,
             "right_thumbstick_click": 1.0 if self._pressed("right_axis_click", now) else 0.0,
+            "right_thumbstick_click": 0.0,
             "left_menu_button": self._pressed("menu", now),
             "left_primary_click": 1.0 if self._pressed("x", now) else 0.0,
             "left_secondary_click": 1.0 if self._pressed("y", now) else 0.0,
