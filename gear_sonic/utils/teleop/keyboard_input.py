@@ -34,6 +34,7 @@ DEFAULT_ACTION_MAPPING = {
     "discard": "d",
     "menu": "p",
     "axis_click": "v",
+    "revo2_mode": "n",
 }
 
 ACTION_CONTROLS = {
@@ -44,6 +45,7 @@ ACTION_CONTROLS = {
     "discard": ("grip", "b"),
     "menu": ("menu",),
     "axis_click": ("axis_click",),
+    "revo2_mode": ("right_axis_click",),
 }
 
 
@@ -147,7 +149,7 @@ class KeyboardControlSource:
             "left_thumbstick": [0.0, 0.0],
             "right_thumbstick": [0.0, 0.0],
             "left_thumbstick_click": 1.0 if self._pressed("axis_click", now) else 0.0,
-            "right_thumbstick_click": 0.0,
+            "right_thumbstick_click": 1.0 if self._pressed("right_axis_click", now) else 0.0,
             "left_menu_button": self._pressed("menu", now),
             "left_primary_click": 1.0 if self._pressed("x", now) else 0.0,
             "left_secondary_click": 1.0 if self._pressed("y", now) else 0.0,
@@ -182,7 +184,8 @@ class KeyboardControlSource:
         self._thread.start()
         print(
             "[Keyboard] atomic actions: s=start/stop, m=planner/pose, "
-            "f=frozen mode, c=record, d=discard, p=pause, v=VR3PT; "
+            "f=frozen mode, c=record, d=discard, p=pause, v=VR3PT, "
+            "n=next Revo2 mode; "
             "raw controls: a=A, b=B, x=X, y=Y, g=Grip"
         )
 

@@ -1,9 +1,10 @@
 """Continuous PICO trigger control for bilateral BrainCo Revo2 hands.
 
 The manager owns input and this module owns the Revo2 serial devices in a
-separate process. Trigger zero holds the measured startup pose; increasing the
-Trigger adds a bounded per-channel delta. This avoids a startup jump because
-Revo2 thumb and finger channels do not share the same neutral value.
+separate process. Each mode combines a fixed per-channel offset with a bounded
+Trigger-scaled delta, both relative to a calibrated open pose when configured,
+or the measured startup pose as a compatibility fallback. Modes with nonzero
+offsets intentionally move on selection.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import math
 import multiprocessing as mp
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -31,6 +32,139 @@ REVO2_CHANNEL_NAMES = (
 REVO2_CHANNEL_COUNT = len(REVO2_CHANNEL_NAMES)
 DEFAULT_THUMB_DELTA = 0.15
 DEFAULT_FINGER_DELTA = 0.20
+REVO2_MODE_NAME_BYTES = 32
+
+
+@dataclass(frozen=True)
+class Revo2TriggerMode:
+    """One named Trigger-to-Revo2 six-channel mapping profile."""
+
+    name: str
+    channels: np.ndarray
+    offsets: np.ndarray = field(
+        default_factory=lambda: np.zeros(REVO2_CHANNEL_COUNT)
+    )
+
+    def __post_init__(self) -> None:
+        name = str(self.name).strip()
+        channels = np.asarray(self.channels, dtype=np.float64)
+        offsets = np.asarray(self.offsets, dtype=np.float64)
+        if not name:
+            raise ValueError("Revo2 trigger mode name must be non-empty")
+        if len(name.encode("utf-8")) > REVO2_MODE_NAME_BYTES:
+            raise ValueError(
+                f"Revo2 trigger mode name must fit within {REVO2_MODE_NAME_BYTES} UTF-8 bytes"
+            )
+        if channels.shape != (REVO2_CHANNEL_COUNT,):
+            raise ValueError(
+                f"Revo2 trigger mode channels must have shape ({REVO2_CHANNEL_COUNT},)"
+            )
+        if not np.isfinite(channels).all():
+            raise ValueError("Revo2 trigger mode channels must be finite")
+        if np.any((channels < 0.0) | (channels > 1.0)):
+            raise ValueError("Revo2 trigger mode channels must be within [0, 1]")
+        if offsets.shape != (REVO2_CHANNEL_COUNT,):
+            raise ValueError(
+                f"Revo2 trigger mode offsets must have shape ({REVO2_CHANNEL_COUNT},)"
+            )
+        if not np.isfinite(offsets).all():
+            raise ValueError("Revo2 trigger mode offsets must be finite")
+        if np.any((offsets < 0.0) | (offsets > 1.0)):
+            raise ValueError("Revo2 trigger mode offsets must be within [0, 1]")
+        channels = np.array(channels, dtype=np.float64, copy=True)
+        offsets = np.array(offsets, dtype=np.float64, copy=True)
+        channels.setflags(write=False)
+        offsets.setflags(write=False)
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "channels", channels)
+        object.__setattr__(self, "offsets", offsets)
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> "Revo2TriggerMode":
+        if not isinstance(value, dict):
+            raise ValueError("each Revo2 trigger mode must be a JSON object")
+        return cls(
+            name=value.get("name", ""),
+            channels=value.get("channels", []),
+            offsets=value.get("offsets", np.zeros(REVO2_CHANNEL_COUNT)),
+        )
+
+
+def default_revo2_trigger_modes(
+    *,
+    thumb_delta: float = DEFAULT_THUMB_DELTA,
+    finger_delta: float = DEFAULT_FINGER_DELTA,
+) -> tuple[Revo2TriggerMode, ...]:
+    """Return the built-in all-fingers, pinch, and point profiles."""
+
+    return (
+        Revo2TriggerMode(
+            "all_fingers",
+            [thumb_delta, thumb_delta, finger_delta, finger_delta, finger_delta, finger_delta],
+        ),
+        Revo2TriggerMode(
+            "pinch",
+            [thumb_delta, thumb_delta, finger_delta, 0.0, 0.0, 0.0],
+        ),
+        Revo2TriggerMode(
+            "point",
+            [thumb_delta, thumb_delta, 0.0, finger_delta, finger_delta, finger_delta],
+        ),
+    )
+
+
+def load_revo2_trigger_modes(
+    path: str | Path | None = None,
+    *,
+    thumb_delta: float = DEFAULT_THUMB_DELTA,
+    finger_delta: float = DEFAULT_FINGER_DELTA,
+) -> tuple[Revo2TriggerMode, ...]:
+    """Load named profiles, or return the three built-in profiles."""
+
+    if path is None:
+        modes = default_revo2_trigger_modes(
+            thumb_delta=thumb_delta,
+            finger_delta=finger_delta,
+        )
+    else:
+        config_path = Path(path).expanduser().resolve(strict=True)
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or not isinstance(raw.get("modes"), list):
+            raise ValueError("Revo2 trigger mode config must contain a 'modes' list")
+        modes = tuple(Revo2TriggerMode.from_mapping(value) for value in raw["modes"])
+    if not modes:
+        raise ValueError("Revo2 trigger mode config must contain at least one mode")
+    names = [mode.name for mode in modes]
+    if len(set(names)) != len(names):
+        raise ValueError("Revo2 trigger mode names must be unique")
+    return modes
+
+
+def encode_revo2_mode_name(name: str) -> np.ndarray:
+    """Encode a profile name as fixed-width UTF-8 int32 values for ZMQ/LeRobot."""
+
+    encoded = str(name).encode("utf-8")
+    if len(encoded) > REVO2_MODE_NAME_BYTES:
+        raise ValueError(
+            f"Revo2 trigger mode name must fit within {REVO2_MODE_NAME_BYTES} UTF-8 bytes"
+        )
+    result = np.zeros(REVO2_MODE_NAME_BYTES, dtype=np.int32)
+    result[: len(encoded)] = np.frombuffer(encoded, dtype=np.uint8).astype(np.int32)
+    return result
+
+
+def revo2_triggers_released(
+    left_trigger: float,
+    right_trigger: float,
+    *,
+    threshold: float = 0.05,
+) -> bool:
+    """Return whether both Triggers are finite and below the switch threshold."""
+
+    values = np.asarray([left_trigger, right_trigger], dtype=np.float64)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("Trigger release threshold must be finite and within [0, 1]")
+    return bool(np.isfinite(values).all() and np.all(values <= threshold))
 
 
 def trigger_to_revo2_deltas(
@@ -38,24 +172,31 @@ def trigger_to_revo2_deltas(
     *,
     thumb_delta: float = DEFAULT_THUMB_DELTA,
     finger_delta: float = DEFAULT_FINGER_DELTA,
+    channels: Sequence[float] | np.ndarray | None = None,
+    offsets: Sequence[float] | np.ndarray | None = None,
 ) -> np.ndarray:
-    """Map one Trigger to bounded deltas for the six Revo2 channels."""
+    """Map one Trigger to fixed plus proportional six-channel deltas."""
 
     value = float(trigger)
     thumb_limit = float(thumb_delta)
     finger_limit = float(finger_delta)
     if not math.isfinite(value):
         raise ValueError("trigger must be finite")
-    if not math.isfinite(thumb_limit) or not 0.0 < thumb_limit <= 0.5:
-        raise ValueError("thumb_delta must be finite and within (0, 0.5]")
-    if not math.isfinite(finger_limit) or not 0.0 < finger_limit <= 0.5:
-        raise ValueError("finger_delta must be finite and within (0, 0.5]")
+    if not math.isfinite(thumb_limit) or not 0.0 < thumb_limit <= 1.0:
+        raise ValueError("thumb_delta must be finite and within (0, 1]")
+    if not math.isfinite(finger_limit) or not 0.0 < finger_limit <= 1.0:
+        raise ValueError("finger_delta must be finite and within (0, 1]")
     value = min(1.0, max(0.0, value))
-    profile = np.asarray(
-        [thumb_limit, thumb_limit, finger_limit, finger_limit, finger_limit, finger_limit],
-        dtype=np.float64,
+    mode = Revo2TriggerMode(
+        "mapping",
+        (
+            [thumb_limit, thumb_limit, finger_limit, finger_limit, finger_limit, finger_limit]
+            if channels is None
+            else channels
+        ),
+        np.zeros(REVO2_CHANNEL_COUNT) if offsets is None else offsets,
     )
-    return value * profile
+    return mode.offsets + value * mode.channels
 
 
 def bilateral_trigger_deltas(
@@ -89,6 +230,7 @@ class Revo2Device:
     port: str
     serial: str
     slave_id: int
+    open_positions: tuple[float, ...] | None = None
 
     @classmethod
     def from_mapping(cls, value: Any) -> "Revo2Device":
@@ -98,6 +240,7 @@ class Revo2Device:
         port = value.get("port")
         serial = value.get("serial")
         slave_id = value.get("slave_id")
+        open_positions_value = value.get("open_positions")
         if side not in {"left", "right"}:
             raise ValueError("Revo2 side must be 'left' or 'right'")
         if not isinstance(port, str) or not port:
@@ -106,7 +249,25 @@ class Revo2Device:
             raise ValueError("Revo2 serial must be a non-empty string")
         if type(slave_id) is not int or not 0 <= slave_id <= 247:
             raise ValueError("Revo2 slave_id must be an integer in [0, 247]")
-        return cls(side=side, port=port, serial=serial, slave_id=slave_id)
+        open_positions = None
+        if open_positions_value is not None:
+            values = np.asarray(open_positions_value, dtype=np.float64)
+            if values.shape != (REVO2_CHANNEL_COUNT,):
+                raise ValueError(
+                    f"Revo2 open_positions must have shape ({REVO2_CHANNEL_COUNT},)"
+                )
+            if not np.isfinite(values).all():
+                raise ValueError("Revo2 open_positions must be finite")
+            if np.any((values < 0.0) | (values > 1.0)):
+                raise ValueError("Revo2 open_positions must be within [0, 1]")
+            open_positions = tuple(float(position) for position in values)
+        return cls(
+            side=side,
+            port=port,
+            serial=serial,
+            slave_id=slave_id,
+            open_positions=open_positions,
+        )
 
 
 def load_revo2_devices(path: str | Path) -> tuple[Revo2Device, Revo2Device]:
@@ -166,6 +327,7 @@ async def _run_revo2_owner(
     clients: list[Any] = []
     locks: list[Any] = []
     previous: list[np.ndarray] = []
+    open_targets: list[np.ndarray] = []
     was_active = False
     motion_may_be_active = False
     last_sequence = -1
@@ -243,10 +405,80 @@ async def _run_revo2_owner(
                 else:
                     clients.append(client)
                     previous.append(measured)
+                    open_targets.append(
+                        measured.copy()
+                        if device.open_positions is None
+                        else np.asarray(device.open_positions, dtype=np.float64)
+                    )
                     break
 
         previous_array = np.asarray(previous, dtype=np.float64)
-        baseline_array = previous_array.copy()
+        baseline_array = np.asarray(open_targets, dtype=np.float64)
+        if not np.allclose(previous_array, baseline_array, rtol=0.0, atol=0.02):
+            print(
+                "[Revo2Trigger] returning both hands to calibrated open positions...",
+                flush=True,
+            )
+            homing_deadline = time.monotonic() + (
+                1.0 / min(slew_per_s, command_speed) + 3.0
+            )
+            homing_next_tick = time.monotonic()
+            while True:
+                limited = _bounded_slew(
+                    previous_array,
+                    baseline_array,
+                    command_period_s,
+                    slew_per_s,
+                )
+                speed_values = [
+                    int(round(command_speed * 1000.0))
+                ] * REVO2_CHANNEL_COUNT
+                motion_may_be_active = True
+                await asyncio.gather(
+                    *[
+                        bounded(
+                            client.set_finger_positions_and_speeds(
+                                device.slave_id,
+                                np.rint(values * 1000.0).astype(int).tolist(),
+                                speed_values,
+                            )
+                        )
+                        for client, device, values in zip(
+                            clients, devices, limited, strict=True
+                        )
+                    ]
+                )
+                previous_array = limited
+                if np.allclose(
+                    previous_array, baseline_array, rtol=0.0, atol=1e-9
+                ):
+                    motor_statuses = await asyncio.gather(
+                        *[
+                            bounded(client.get_motor_status(device.slave_id), timeout=0.5)
+                            for client, device in zip(clients, devices, strict=True)
+                        ]
+                    )
+                    measured_array = np.asarray(
+                        [motor_status.positions for motor_status in motor_statuses],
+                        dtype=np.float64,
+                    ) / 1000.0
+                    if np.allclose(
+                        measured_array, baseline_array, rtol=0.0, atol=0.02
+                    ):
+                        await stop_motion()
+                        motion_may_be_active = False
+                        print(
+                            "[Revo2Trigger] both hands are at calibrated open positions",
+                            flush=True,
+                        )
+                        break
+                if time.monotonic() >= homing_deadline:
+                    raise TimeoutError(
+                        "Revo2 startup opening did not reach calibrated positions"
+                    )
+                homing_next_tick += command_period_s
+                await asyncio.sleep(max(0.0, homing_next_tick - time.monotonic()))
+
         status.send(("ready", None))
         next_tick = time.monotonic()
         timeout_ns = int(deadman_s * 1e9)
@@ -256,7 +488,9 @@ async def _run_revo2_owner(
             with source_received_ns.get_lock():
                 received_ns = int(source_received_ns.value)
             active = (
-                enabled.is_set() and received_ns > 0 and 0 <= now_ns - received_ns <= timeout_ns
+                enabled.is_set()
+                and received_ns > 0
+                and 0 <= now_ns - received_ns <= timeout_ns
             )
 
             if enabled.is_set() and received_ns > 0 and now_ns - received_ns > timeout_ns:
@@ -346,6 +580,7 @@ class Revo2TriggerOutput:
         finger_delta: float = DEFAULT_FINGER_DELTA,
         command_speed: float = 0.25,
         startup_timeout_s: float = 45.0,
+        modes: Sequence[Revo2TriggerMode] | None = None,
     ) -> None:
         if tuple(device.side for device in devices) != ("left", "right"):
             raise ValueError("Revo2 devices must be ordered left then right")
@@ -355,17 +590,44 @@ class Revo2TriggerOutput:
             raise ValueError("Revo2 slew must be within [0.01, 0.5] per second")
         if not 0.01 <= command_period_s <= 1.0:
             raise ValueError("Revo2 command period must be within [0.01, 1.0] seconds")
-        if not math.isfinite(thumb_delta) or not 0.0 < thumb_delta <= 0.5:
-            raise ValueError("Revo2 thumb_delta must be finite and within (0, 0.5]")
-        if not math.isfinite(finger_delta) or not 0.0 < finger_delta <= 0.5:
-            raise ValueError("Revo2 finger_delta must be finite and within (0, 0.5]")
+        if not math.isfinite(thumb_delta) or not 0.0 < thumb_delta <= 1.0:
+            raise ValueError("Revo2 thumb_delta must be finite and within (0, 1]")
+        if not math.isfinite(finger_delta) or not 0.0 < finger_delta <= 1.0:
+            raise ValueError("Revo2 finger_delta must be finite and within (0, 1]")
         if not math.isfinite(command_speed) or not 0.01 <= command_speed <= 0.3:
             raise ValueError("Revo2 command_speed must be finite and within [0.01, 0.3]")
 
         self.devices = tuple(devices)
         self.thumb_delta = float(thumb_delta)
         self.finger_delta = float(finger_delta)
-        self.startup_timeout_s = float(startup_timeout_s)
+        self.modes = (
+            tuple(modes)
+            if modes is not None
+            else (
+                Revo2TriggerMode(
+                    "all_fingers",
+                    [
+                        thumb_delta,
+                        thumb_delta,
+                        finger_delta,
+                        finger_delta,
+                        finger_delta,
+                        finger_delta,
+                    ],
+                ),
+            )
+        )
+        if not self.modes:
+            raise ValueError("Revo2 trigger output requires at least one mode")
+        if not all(isinstance(mode, Revo2TriggerMode) for mode in self.modes):
+            raise TypeError("modes must contain Revo2TriggerMode values")
+        if len({mode.name for mode in self.modes}) != len(self.modes):
+            raise ValueError("Revo2 trigger mode names must be unique")
+        self._mode_index = 0
+        self.startup_timeout_s = max(
+            float(startup_timeout_s),
+            1.0 / min(float(slew_per_s), float(command_speed)) + 5.0,
+        )
         ctx = mp.get_context("spawn")
         self._targets = ctx.Array("d", 2 * REVO2_CHANNEL_COUNT)
         self._source_received_ns = ctx.Value("q", 0)
@@ -439,11 +701,20 @@ class Revo2TriggerOutput:
         self.check_health()
         if source_received_monotonic_ns <= 0:
             raise ValueError("source receive timestamp must be positive")
-        target = bilateral_trigger_deltas(
-            left_trigger,
-            right_trigger,
-            thumb_delta=self.thumb_delta,
-            finger_delta=self.finger_delta,
+        mode = self.current_mode
+        target = np.stack(
+            (
+                trigger_to_revo2_deltas(
+                    left_trigger,
+                    channels=mode.channels,
+                    offsets=mode.offsets,
+                ),
+                trigger_to_revo2_deltas(
+                    right_trigger,
+                    channels=mode.channels,
+                    offsets=mode.offsets,
+                ),
+            )
         )
         with self._targets.get_lock():
             self._targets[:] = target.reshape(-1).tolist()
@@ -451,6 +722,22 @@ class Revo2TriggerOutput:
             self._source_received_ns.value = int(source_received_monotonic_ns)
         with self._sequence.get_lock():
             self._sequence.value += 1
+
+    @property
+    def current_mode_index(self) -> int:
+        return self._mode_index
+
+    @property
+    def current_mode(self) -> Revo2TriggerMode:
+        return self.modes[self._mode_index]
+
+    def cycle_mode(self) -> Revo2TriggerMode:
+        """Select and return the next mode, wrapping after the final mode."""
+
+        if self._closed:
+            raise RuntimeError("Revo2 trigger owner is closed")
+        self._mode_index = (self._mode_index + 1) % len(self.modes)
+        return self.current_mode
 
     def check_health(self) -> None:
         if not self._started or self._closed:

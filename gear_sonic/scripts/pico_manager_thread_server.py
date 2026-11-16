@@ -1980,8 +1980,10 @@ def run_pico_manager(
     keyboard_discard: str = "d",
     keyboard_menu: str = "p",
     keyboard_axis_click: str = "v",
+    keyboard_revo2_mode: str = "n",
     revo2_trigger: bool = False,
     revo2_devices: str | None = None,
+    revo2_modes: str | None = None,
     revo2_deadman_s: float = 0.3,
     revo2_slew_per_s: float = 0.4,
     revo2_command_period_s: float = 0.04,
@@ -2019,6 +2021,7 @@ def run_pico_manager(
                 "discard": keyboard_discard,
                 "menu": keyboard_menu,
                 "axis_click": keyboard_axis_click,
+                "revo2_mode": keyboard_revo2_mode,
             },
         )
         try:
@@ -2086,7 +2089,10 @@ def run_pico_manager(
     #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
-    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    print(
+        "Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy, "
+        "right stick click=next Revo2 mode"
+    )
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
@@ -2124,10 +2130,18 @@ def run_pico_manager(
         if revo2_trigger:
             from gear_sonic.utils.teleop.revo2_trigger import (
                 Revo2TriggerOutput,
+                encode_revo2_mode_name,
                 load_revo2_devices,
+                load_revo2_trigger_modes,
+                revo2_triggers_released,
             )
 
             devices = load_revo2_devices(revo2_devices)
+            trigger_modes = load_revo2_trigger_modes(
+                revo2_modes,
+                thumb_delta=revo2_thumb_delta,
+                finger_delta=revo2_finger_delta,
+            )
             revo2_output = Revo2TriggerOutput(
                 devices,
                 deadman_s=revo2_deadman_s,
@@ -2136,18 +2150,22 @@ def run_pico_manager(
                 thumb_delta=revo2_thumb_delta,
                 finger_delta=revo2_finger_delta,
                 command_speed=revo2_command_speed,
+                modes=trigger_modes,
             )
             revo2_output.start()
+            active_mode = revo2_output.current_mode
             print(
                 "[Manager] Revo2 Trigger output ready; "
-                f"startup-relative thumb_delta={revo2_thumb_delta:.3f}, "
-                f"finger_delta={revo2_finger_delta:.3f}"
+                f"mode 1/{len(revo2_output.modes)}: {active_mode.name}; "
+                f"channels={active_mode.channels.round(3).tolist()}; "
+                f"offsets={active_mode.offsets.round(3).tolist()}"
             )
 
         prev_ax_pressed = False
         prev_by_pressed = False
         prev_start_combo = False
         prev_left_axis_click = False
+        prev_right_axis_click = False
         while True:
             if revo2_output is not None:
                 revo2_output.check_health()
@@ -2171,7 +2189,26 @@ def run_pico_manager(
                 reader, keyboard=None
             )
 
-            left_axis_click, _ = get_axis_clicks(reader, keyboard=keyboard)
+            left_axis_click, right_axis_click = get_axis_clicks(reader, keyboard=keyboard)
+
+            if (
+                revo2_output is not None
+                and right_axis_click
+                and not prev_right_axis_click
+            ):
+                if not revo2_triggers_released(left_trigger, right_trigger):
+                    print(
+                        "[Revo2Trigger] mode switch ignored: release both Triggers first"
+                    )
+                else:
+                    active_mode = revo2_output.cycle_mode()
+                    print(
+                        "[Revo2Trigger] "
+                        f"mode {revo2_output.current_mode_index + 1}/"
+                        f"{len(revo2_output.modes)}: {active_mode.name}; "
+                        f"channels={active_mode.channels.round(3).tolist()}; "
+                        f"offsets={active_mode.offsets.round(3).tolist()}"
+                    )
 
             # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
             ax_pressed = (a_pressed) and (x_pressed)
@@ -2322,6 +2359,29 @@ def run_pico_manager(
                         "stream_mode": np.array([current_mode.value], dtype=np.int32),
                         "toggle_data_collection": np.array([toggle_dc], dtype=bool),
                         "toggle_data_abort": np.array([toggle_da], dtype=bool),
+                        "revo2_mode_index": np.array(
+                            [
+                                revo2_output.current_mode_index
+                                if revo2_output is not None
+                                else -1
+                            ],
+                            dtype=np.int32,
+                        ),
+                        "revo2_mode_name_utf8": (
+                            encode_revo2_mode_name(revo2_output.current_mode.name)
+                            if revo2_output is not None
+                            else np.zeros(32, dtype=np.int32)
+                        ),
+                        "revo2_mode_channels": (
+                            revo2_output.current_mode.channels.astype(np.float32)
+                            if revo2_output is not None
+                            else np.zeros(6, dtype=np.float32)
+                        ),
+                        "revo2_mode_offsets": (
+                            revo2_output.current_mode.offsets.astype(np.float32)
+                            if revo2_output is not None
+                            else np.zeros(6, dtype=np.float32)
+                        ),
                     },
                     topic="manager_state",
                 )
@@ -2331,6 +2391,7 @@ def run_pico_manager(
             prev_by_pressed = by_pressed
             prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
+            prev_right_axis_click = right_axis_click
 
     except KeyboardInterrupt:
         print("\nStopping manager...")
@@ -2490,14 +2551,25 @@ if __name__ == "__main__":
         help="Keyboard key mapped to left thumbstick click",
     )
     parser.add_argument(
+        "--keyboard-revo2-mode",
+        type=str,
+        default="n",
+        help="Keyboard key mapped to next Revo2 mode (right thumbstick click)",
+    )
+    parser.add_argument(
         "--revo2-trigger",
         action="store_true",
-        help="Linearly map each PICO Trigger to all six channels of its Revo2 hand",
+        help="Map each PICO Trigger through a selectable six-channel Revo2 profile",
     )
     parser.add_argument(
         "--revo2-devices",
         type=str,
         help="JSON file containing verified left/right Revo2 port, serial, and slave_id",
+    )
+    parser.add_argument(
+        "--revo2-modes",
+        type=str,
+        help="Optional JSON file containing named Trigger-to-Revo2 mode profiles",
     )
     parser.add_argument("--revo2-deadman-s", type=float, default=0.3)
     parser.add_argument("--revo2-slew-per-s", type=float, default=0.4)
@@ -2565,8 +2637,10 @@ if __name__ == "__main__":
             keyboard_discard=args.keyboard_discard,
             keyboard_menu=args.keyboard_menu,
             keyboard_axis_click=args.keyboard_axis_click,
+            keyboard_revo2_mode=args.keyboard_revo2_mode,
             revo2_trigger=args.revo2_trigger,
             revo2_devices=args.revo2_devices,
+            revo2_modes=args.revo2_modes,
             revo2_deadman_s=args.revo2_deadman_s,
             revo2_slew_per_s=args.revo2_slew_per_s,
             revo2_command_period_s=args.revo2_command_period_s,
