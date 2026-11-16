@@ -443,8 +443,12 @@ class IsaacTeleopReader:
                 time.sleep(self._period)
                 continue
 
+            stamp_ns = int(self._client.get_timestamp_ns())
+            received_monotonic_ns = time.monotonic_ns()
             controller = _build_controller_dict(raw)
             if controller is not None:
+                controller["source_timestamp_ns"] = stamp_ns
+                controller["received_monotonic_ns"] = received_monotonic_ns
                 with self._ctrl_lock:
                     self._latest_controller = controller
 
@@ -457,7 +461,6 @@ class IsaacTeleopReader:
                 time.sleep(self._period)
                 continue
 
-            stamp_ns = int(self._client.get_timestamp_ns())
             prev_stamp_ns = self._last_stamp_ns
             device_dt = ((stamp_ns - prev_stamp_ns) * 1e-9) if prev_stamp_ns is not None else 0.0
             if device_dt > 0.0:
@@ -472,7 +475,7 @@ class IsaacTeleopReader:
             sample = {
                 "body_poses_np": body_poses,
                 "timestamp_realtime": time.time(),
-                "timestamp_monotonic": time.monotonic(),
+                "timestamp_monotonic": received_monotonic_ns * 1e-9,
                 "timestamp_ns": stamp_ns,
                 "dt": device_dt,
                 "fps": self._fps_ema,

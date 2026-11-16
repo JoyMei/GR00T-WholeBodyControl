@@ -35,6 +35,8 @@ from gear_sonic.data.features_sonic_vla import (
     get_features_sonic_vla,
     get_g1_robot_model,
     get_modality_config_sonic_vla,
+    get_revo2_features,
+    get_revo2_modality_config,
     get_wrist_camera_features,
     get_wrist_camera_modality_config,
 )
@@ -47,6 +49,11 @@ from gear_sonic.utils.data_collection.transforms import compute_projected_gravit
 from gear_sonic.utils.data_collection.zmq_state_subscriber import (
     ZMQStateSubscriber,
     poll_robot_config_zmq,
+)
+from gear_sonic.utils.teleop.revo2_data import (
+    revo2_capture_metadata,
+    revo2_state_freshness,
+    revo2_state_to_features,
 )
 
 # ---------------------------------------------------------------------------
@@ -99,6 +106,18 @@ class SonicDataExporterConfig:
 
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist). Requires cameras to be available."""
+
+    record_revo2: bool = False
+    """Record measured/command/tactile Revo2 fields from the manager's revo2_state topic."""
+
+    revo2_devices: str | None = None
+    """Same verified bilateral device JSON used by the manager; stored as provenance."""
+
+    revo2_max_age_ms: float = 200.0
+    """Maximum accepted Revo2 publisher, motor, and tactile sample age."""
+
+    require_revo2_tactile: bool = True
+    """Require fresh bilateral tactile data whenever Revo2 recording is enabled."""
 
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
@@ -227,12 +246,20 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        record_revo2: bool = False,
+        revo2_max_age_ms: float = 200.0,
+        require_revo2_tactile: bool = True,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
         self.loop_period = 1.0 / frequency
         self.data_exporter = data_exporter
         self.robot_model = robot_model
+        self.record_revo2 = bool(record_revo2)
+        if not np.isfinite(revo2_max_age_ms) or not 20.0 <= revo2_max_age_ms <= 2000.0:
+            raise ValueError("revo2_max_age_ms must be finite and within [20, 2000]")
+        self.revo2_max_age_ns = int(revo2_max_age_ms * 1e6)
+        self.require_revo2_tactile = bool(require_revo2_tactile)
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
@@ -244,6 +271,7 @@ class GrootDataCollector:
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
+        self.latest_revo2_msg = None
 
         self.current_stream_mode = 0
 
@@ -267,9 +295,14 @@ class GrootDataCollector:
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "pose")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "planner")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
+            if self.record_revo2:
+                self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "revo2_state")
             time.sleep(0.5)
             print(f"[Sonic] Connected to ZMQ at {sonic_data_zmq_host}:{sonic_data_zmq_port}")
-            print("[Sonic] Subscribed to: pose, planner, manager_state")
+            topics = ["pose", "planner", "manager_state"]
+            if self.record_revo2:
+                topics.append("revo2_state")
+            print(f"[Sonic] Subscribed to: {', '.join(topics)}")
         except Exception as e:
             print(f"[Sonic] Warning: Failed to initialize ZMQ subscriber: {e}")
             self._sonic_zmq_socket = None
@@ -280,6 +313,7 @@ class GrootDataCollector:
         )
 
         self._last_latency_log_time = 0.0
+        self._last_revo2_wait_log_time = 0.0
         self._initial_yaw = None
 
         print(f"Recording to {self.data_exporter.meta.root}")
@@ -348,6 +382,8 @@ class GrootDataCollector:
 
             if raw.startswith(b"manager_state"):
                 self._handle_manager_state(raw)
+            elif raw.startswith(b"revo2_state"):
+                self._handle_revo2_state(raw)
             elif raw.startswith(b"planner"):
                 self._handle_planner_message(raw)
             elif raw.startswith(b"pose"):
@@ -366,6 +402,12 @@ class GrootDataCollector:
             self._manager_toggle_dc = True
         if self._extract_bool(data, "toggle_data_abort"):
             self._manager_toggle_da = True
+
+    def _handle_revo2_state(self, raw: bytes) -> None:
+        try:
+            self.latest_revo2_msg = unpack_pose_message(raw, topic="revo2_state")
+        except Exception as exc:
+            print(f"[Revo2] Error unpacking state message: {exc}")
 
     def _handle_planner_message(self, raw: bytes) -> None:
         try:
@@ -566,10 +608,30 @@ class GrootDataCollector:
             )
             return False
 
+        if self.record_revo2:
+            if self.latest_revo2_msg is None:
+                self._log_revo2_wait("no revo2_state message received")
+                return False
+            ready, reason = revo2_state_freshness(
+                self.latest_revo2_msg,
+                now_monotonic_ns=time.monotonic_ns(),
+                max_age_ns=self.revo2_max_age_ns,
+                require_tactile=self.require_revo2_tactile,
+            )
+            if not ready:
+                self._log_revo2_wait(reason)
+                return False
+
         if self._episode_state.get_state() != self._episode_state.RECORDING:
             return self._finalize_frame(t_start)
 
         return self._add_data_frame_sonic(t_start)
+
+    def _log_revo2_wait(self, reason: str) -> None:
+        now = time.monotonic()
+        if now - self._last_revo2_wait_log_time >= 1.0:
+            self._last_revo2_wait_log_time = now
+            self._print_and_say(f"Waiting for Revo2 data: {reason}", say=False)
 
     def _add_data_frame_sonic(self, t_start: float) -> bool:
         """Build one data frame in Sonic CPP + SMPL mode."""
@@ -607,6 +669,14 @@ class GrootDataCollector:
         self._add_cpp_state_features(frame_data, proprio)
 
         sonic_latency_ms = self._add_sonic_pose_features(frame_data)
+
+        if self.record_revo2:
+            assert self.latest_revo2_msg is not None
+            frame_data.update(
+                revo2_state_to_features(
+                    self.latest_revo2_msg, now_monotonic_ns=time.monotonic_ns()
+                )
+            )
 
         self._add_images_to_frame_data(frame_data)
 
@@ -924,6 +994,24 @@ def main(config: SonicDataExporterConfig):
             else:
                 modality_config[key] = value
 
+    revo2_metadata = None
+    if config.record_revo2:
+        if not config.revo2_devices:
+            raise ValueError("revo2_devices is required when Revo2 recording is enabled")
+        from gear_sonic.utils.teleop.revo2_trigger import load_revo2_devices
+
+        revo2_metadata = revo2_capture_metadata(
+            load_revo2_devices(config.revo2_devices)
+        )
+        print("[Revo2] Measured motor, command, and tactile fields enabled")
+        dataset_features.update(get_revo2_features())
+        revo2_modality = get_revo2_modality_config()
+        for key, value in revo2_modality.items():
+            if key in modality_config:
+                modality_config[key].update(value)
+            else:
+                modality_config[key] = value
+
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
     robot_config = poll_robot_config_zmq(
@@ -936,7 +1024,14 @@ def main(config: SonicDataExporterConfig):
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        script_config={
+            **robot_config,
+            "record_wrist_cameras": config.record_wrist_cameras,
+            "record_revo2": config.record_revo2,
+            "revo2_capture": revo2_metadata,
+            "revo2_max_age_ms": config.revo2_max_age_ms,
+            "require_revo2_tactile": config.require_revo2_tactile,
+        },
     )
 
     data_collector = GrootDataCollector(
@@ -950,6 +1045,9 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        record_revo2=config.record_revo2,
+        revo2_max_age_ms=config.revo2_max_age_ms,
+        require_revo2_tactile=config.require_revo2_tactile,
     )
     data_collector.run()
 

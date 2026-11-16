@@ -11,9 +11,20 @@ Joint names, counts, and group indices are derived at runtime from the
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from gear_sonic.data.robot_model import RobotModel
+if TYPE_CHECKING:
+    from gear_sonic.data.robot_model import RobotModel
+else:
+    RobotModel = Any
+from gear_sonic.utils.teleop.revo2_data import (
+    REVO2_CAPACITIVE_VALUES_PER_HAND,
+    REVO2_HAND_COUNT,
+    REVO2_MOTOR_COUNT,
+    REVO2_PRESSURE_DETAILED_VALUES_PER_HAND,
+    REVO2_PRESSURE_VALUES_PER_HAND,
+    revo2_feature_names,
+)
 
 EGO_VIEW_HEIGHT: int = 480
 EGO_VIEW_WIDTH: int = 640
@@ -391,6 +402,239 @@ def get_wrist_camera_modality_config() -> dict:
         "video": {
             "left_wrist": {"original_key": "observation.images.left_wrist"},
             "right_wrist": {"original_key": "observation.images.right_wrist"},
+        },
+    }
+
+
+def get_revo2_features() -> dict:
+    """Optional measured/command/tactile features from the bilateral Revo2 owner."""
+
+    names = revo2_feature_names()
+    motor_shape = (REVO2_HAND_COUNT * REVO2_MOTOR_COUNT,)
+    return {
+        "observation.revo2.motor_position": {
+            "dtype": "float32",
+            "shape": motor_shape,
+            "names": names["motor"],
+        },
+        "observation.revo2.motor_speed_raw": {
+            "dtype": "float32",
+            "shape": motor_shape,
+            "names": names["motor"],
+        },
+        "observation.revo2.motor_current_raw": {
+            "dtype": "float32",
+            "shape": motor_shape,
+            "names": names["motor"],
+        },
+        "observation.revo2.motor_state_code": {
+            "dtype": "int32",
+            "shape": motor_shape,
+            "names": names["motor"],
+        },
+        "action.revo2.command_position": {
+            "dtype": "float32",
+            "shape": motor_shape,
+            "names": names["motor"],
+        },
+        "teleop.revo2.source_trigger": {
+            "dtype": "float32",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.capacitive_raw": {
+            "dtype": "float32",
+            "shape": (REVO2_HAND_COUNT * REVO2_CAPACITIVE_VALUES_PER_HAND,),
+            "names": names["capacitive"],
+        },
+        "observation.revo2.pressure_summary_raw": {
+            "dtype": "float32",
+            "shape": (REVO2_HAND_COUNT * REVO2_PRESSURE_VALUES_PER_HAND,),
+            "names": names["pressure"],
+        },
+        "observation.revo2.pressure_detailed_raw": {
+            "dtype": "float32",
+            "shape": (REVO2_HAND_COUNT * REVO2_PRESSURE_DETAILED_VALUES_PER_HAND,),
+            "names": names["pressure_detailed"],
+        },
+        "observation.revo2.touch_type": {
+            "dtype": "int32",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.motor_valid": {
+            "dtype": "int32",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.touch_valid": {
+            "dtype": "int32",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.pressure_detailed_valid": {
+            "dtype": "int32",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.motor_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.touch_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.pressure_detailed_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.motor_age_ms": {
+            "dtype": "float32",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.touch_age_ms": {
+            "dtype": "float32",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.pressure_detailed_age_ms": {
+            "dtype": "float32",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.motor_samples_coalesced": {
+            "dtype": "int64",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.touch_samples_coalesced": {
+            "dtype": "int64",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.pressure_detailed_samples_coalesced": {
+            "dtype": "int64",
+            "shape": (REVO2_HAND_COUNT,),
+            "names": names["sides"],
+        },
+        "observation.revo2.command_deadlines_coalesced": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["command_deadlines_coalesced"],
+        },
+        "observation.revo2.publish_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["publish_monotonic_ns"],
+        },
+        "teleop.revo2.source_received_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["source_received_monotonic_ns"],
+        },
+        "teleop.revo2.source_sequence": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["source_sequence"],
+        },
+    }
+
+
+def get_revo2_modality_config() -> dict:
+    """Modality entries for the optional Revo2 LeRobot fields."""
+
+    motor_dim = REVO2_HAND_COUNT * REVO2_MOTOR_COUNT
+    state_keys = {
+        "motor_position": ("observation.revo2.motor_position", motor_dim),
+        "motor_speed_raw": ("observation.revo2.motor_speed_raw", motor_dim),
+        "motor_current_raw": ("observation.revo2.motor_current_raw", motor_dim),
+        "motor_state_code": ("observation.revo2.motor_state_code", motor_dim),
+        "capacitive_raw": (
+            "observation.revo2.capacitive_raw",
+            REVO2_HAND_COUNT * REVO2_CAPACITIVE_VALUES_PER_HAND,
+        ),
+        "pressure_summary_raw": (
+            "observation.revo2.pressure_summary_raw",
+            REVO2_HAND_COUNT * REVO2_PRESSURE_VALUES_PER_HAND,
+        ),
+        "pressure_detailed_raw": (
+            "observation.revo2.pressure_detailed_raw",
+            REVO2_HAND_COUNT * REVO2_PRESSURE_DETAILED_VALUES_PER_HAND,
+        ),
+        "touch_type": ("observation.revo2.touch_type", REVO2_HAND_COUNT),
+        "motor_valid": ("observation.revo2.motor_valid", REVO2_HAND_COUNT),
+        "touch_valid": ("observation.revo2.touch_valid", REVO2_HAND_COUNT),
+        "pressure_detailed_valid": (
+            "observation.revo2.pressure_detailed_valid",
+            REVO2_HAND_COUNT,
+        ),
+        "motor_monotonic_ns": (
+            "observation.revo2.motor_monotonic_ns",
+            REVO2_HAND_COUNT,
+        ),
+        "touch_monotonic_ns": (
+            "observation.revo2.touch_monotonic_ns",
+            REVO2_HAND_COUNT,
+        ),
+        "pressure_detailed_monotonic_ns": (
+            "observation.revo2.pressure_detailed_monotonic_ns",
+            REVO2_HAND_COUNT,
+        ),
+        "motor_age_ms": ("observation.revo2.motor_age_ms", REVO2_HAND_COUNT),
+        "touch_age_ms": ("observation.revo2.touch_age_ms", REVO2_HAND_COUNT),
+        "pressure_detailed_age_ms": (
+            "observation.revo2.pressure_detailed_age_ms",
+            REVO2_HAND_COUNT,
+        ),
+        "motor_samples_coalesced": (
+            "observation.revo2.motor_samples_coalesced",
+            REVO2_HAND_COUNT,
+        ),
+        "touch_samples_coalesced": (
+            "observation.revo2.touch_samples_coalesced",
+            REVO2_HAND_COUNT,
+        ),
+        "pressure_detailed_samples_coalesced": (
+            "observation.revo2.pressure_detailed_samples_coalesced",
+            REVO2_HAND_COUNT,
+        ),
+        "command_deadlines_coalesced": (
+            "observation.revo2.command_deadlines_coalesced",
+            1,
+        ),
+        "publish_monotonic_ns": ("observation.revo2.publish_monotonic_ns", 1),
+    }
+    return {
+        "state": {
+            f"revo2_{name}": {"start": 0, "end": end, "original_key": key}
+            for name, (key, end) in state_keys.items()
+        },
+        "action": {
+            "revo2_command_position": {
+                "start": 0,
+                "end": REVO2_HAND_COUNT * REVO2_MOTOR_COUNT,
+                "original_key": "action.revo2.command_position",
+            },
+            "revo2_source_trigger": {
+                "start": 0,
+                "end": REVO2_HAND_COUNT,
+                "original_key": "teleop.revo2.source_trigger",
+            },
+            "revo2_source_received_monotonic_ns": {
+                "start": 0,
+                "end": 1,
+                "original_key": "teleop.revo2.source_received_monotonic_ns",
+            },
+            "revo2_source_sequence": {
+                "start": 0,
+                "end": 1,
+                "original_key": "teleop.revo2.source_sequence",
+            },
         },
     }
 
