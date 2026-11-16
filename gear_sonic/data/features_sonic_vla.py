@@ -167,6 +167,26 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
                 "end": 1,
                 "original_key": "teleop.stream_mode",
             },
+            "revo2_mode_index": {
+                "start": 0,
+                "end": 1,
+                "original_key": "teleop.revo2_mode_index",
+            },
+            "revo2_mode_name_utf8": {
+                "start": 0,
+                "end": 32,
+                "original_key": "teleop.revo2_mode_name_utf8",
+            },
+            "revo2_mode_channels": {
+                "start": 0,
+                "end": 6,
+                "original_key": "teleop.revo2_mode_channels",
+            },
+            "revo2_mode_offsets": {
+                "start": 0,
+                "end": 6,
+                "original_key": "teleop.revo2_mode_offsets",
+            },
             "planner_mode": {
                 "start": 0,
                 "end": 1,
@@ -333,6 +353,40 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "dtype": "int32",
             "shape": (1,),
             "names": ["stream_mode"],
+        },
+        "teleop.revo2_mode_index": {
+            "dtype": "int32",
+            "shape": (1,),
+            "names": ["revo2_mode_index"],
+        },
+        "teleop.revo2_mode_name_utf8": {
+            "dtype": "int32",
+            "shape": (32,),
+            "names": [f"utf8_byte_{index}" for index in range(32)],
+        },
+        "teleop.revo2_mode_channels": {
+            "dtype": "float32",
+            "shape": (6,),
+            "names": [
+                "thumb_flex",
+                "thumb_rotation",
+                "index",
+                "middle",
+                "ring",
+                "pinky",
+            ],
+        },
+        "teleop.revo2_mode_offsets": {
+            "dtype": "float32",
+            "shape": (6,),
+            "names": [
+                "thumb_flex",
+                "thumb_rotation",
+                "index",
+                "middle",
+                "ring",
+                "pinky",
+            ],
         },
         "teleop.planner_mode": {
             "dtype": "int32",

@@ -273,6 +273,11 @@ def revo2_capture_metadata(devices: Sequence[Any]) -> dict[str, Any]:
                 "port": str(device.port),
                 "serial": str(device.serial),
                 "slave_id": int(device.slave_id),
+                "open_positions": (
+                    list(device.open_positions)
+                    if device.open_positions is not None
+                    else None
+                ),
             }
             for device in devices
         ],

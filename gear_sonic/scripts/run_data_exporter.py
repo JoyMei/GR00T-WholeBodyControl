@@ -274,6 +274,10 @@ class GrootDataCollector:
         self.latest_revo2_msg = None
 
         self.current_stream_mode = 0
+        self.current_revo2_mode_index = -1
+        self.current_revo2_mode_name_utf8 = np.zeros(32, dtype=np.int32)
+        self.current_revo2_mode_channels = np.zeros(6, dtype=np.float32)
+        self.current_revo2_mode_offsets = np.zeros(6, dtype=np.float32)
 
         self._manager_toggle_dc = False
         self._manager_toggle_da = False
@@ -397,6 +401,20 @@ class GrootDataCollector:
 
         if "stream_mode" in data:
             self.current_stream_mode = int(data["stream_mode"].flat[0])
+        if "revo2_mode_index" in data:
+            self.current_revo2_mode_index = int(data["revo2_mode_index"].flat[0])
+        if "revo2_mode_name_utf8" in data and data["revo2_mode_name_utf8"].size == 32:
+            self.current_revo2_mode_name_utf8 = (
+                data["revo2_mode_name_utf8"].flatten().astype(np.int32)
+            )
+        if "revo2_mode_channels" in data and data["revo2_mode_channels"].size == 6:
+            self.current_revo2_mode_channels = (
+                data["revo2_mode_channels"].flatten().astype(np.float32)
+            )
+        if "revo2_mode_offsets" in data and data["revo2_mode_offsets"].size == 6:
+            self.current_revo2_mode_offsets = (
+                data["revo2_mode_offsets"].flatten().astype(np.float32)
+            )
 
         if self._extract_bool(data, "toggle_data_collection"):
             self._manager_toggle_dc = True
@@ -739,6 +757,12 @@ class GrootDataCollector:
         sonic_latency_ms = None
 
         frame_data["teleop.stream_mode"] = np.array([self.current_stream_mode], dtype=np.int32)
+        frame_data["teleop.revo2_mode_index"] = np.array(
+            [self.current_revo2_mode_index], dtype=np.int32
+        )
+        frame_data["teleop.revo2_mode_name_utf8"] = self.current_revo2_mode_name_utf8.copy()
+        frame_data["teleop.revo2_mode_channels"] = self.current_revo2_mode_channels.copy()
+        frame_data["teleop.revo2_mode_offsets"] = self.current_revo2_mode_offsets.copy()
 
         smpl_msg = self.latest_sonic_msg
         use_smpl = False

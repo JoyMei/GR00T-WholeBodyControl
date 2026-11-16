@@ -29,6 +29,15 @@ def test_keyboard_source_projects_menu_and_axis_click_buttons():
     assert data["left_thumbstick_click"] == 1.0
 
 
+def test_keyboard_source_projects_revo2_mode_action_as_right_axis_click():
+    source = KeyboardControlSource(ttl_sec=0.25)
+    source.feed_key("n", now=17.0)
+
+    data = source.get_controller_data(now=17.1)
+
+    assert data["right_thumbstick_click"] == 1.0
+
+
 def test_keyboard_source_projects_atomic_start_stop_without_partial_chord():
     source = KeyboardControlSource(ttl_sec=0.25)
     source.feed_key("s", now=20.0)
