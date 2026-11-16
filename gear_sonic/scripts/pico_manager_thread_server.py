@@ -22,13 +22,13 @@
 
 """
 
+from collections import defaultdict, deque
+from contextlib import ExitStack
+from enum import Enum, IntEnum
 import os
 import subprocess
 import threading
 import time
-from collections import defaultdict, deque
-from contextlib import ExitStack
-from enum import Enum, IntEnum
 
 import msgpack
 import numpy as np
@@ -37,6 +37,9 @@ import zmq
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Rotation as sRot
 
+from gear_sonic.utils.teleop import input_readers
+from gear_sonic.utils.teleop.keyboard_input import KeyboardControlSource
+from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
     angle_axis_to_quaternion,
@@ -46,9 +49,6 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_angle_axis,
     quaternion_to_rotation_matrix,
 )
-from gear_sonic.utils.teleop import input_readers
-from gear_sonic.utils.teleop.keyboard_input import KeyboardControlSource
-from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 
 try:
     from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -854,7 +854,7 @@ class PicoReader:
 
     def stop(self):
         self._stop.set()
-        self._thread.join(timeout=1.0)
+        self._thread.join()
 
     def get_latest(self):
         with self._lock:
@@ -2001,6 +2001,7 @@ def run_pico_manager(
         raise ValueError("control_source must be 'controller' or 'keyboard'")
     if revo2_trigger and not revo2_devices:
         raise ValueError("revo2_devices is required when Revo2 Trigger output is enabled")
+
     reader = _init_input_source(input_source, buffer_size)
     keyboard = None
     if control_source == "keyboard":
@@ -2251,7 +2252,6 @@ def run_pico_manager(
                         f"channels={active_mode.channels.round(3).tolist()}; "
                         f"offsets={active_mode.offsets.round(3).tolist()}"
                     )
-
             # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
             ax_pressed = (a_pressed) and (x_pressed)
 
