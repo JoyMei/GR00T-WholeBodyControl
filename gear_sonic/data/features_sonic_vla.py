@@ -176,6 +176,16 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
                 "end": 6,
                 "original_key": "teleop.revo2_mode_offsets",
             },
+            "revo2_left_locked": {
+                "start": 0,
+                "end": 1,
+                "original_key": "teleop.revo2_left_locked",
+            },
+            "revo2_right_locked": {
+                "start": 0,
+                "end": 1,
+                "original_key": "teleop.revo2_right_locked",
+            },
             "planner_mode": {
                 "start": 0,
                 "end": 1,
@@ -376,6 +386,16 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
                 "ring",
                 "pinky",
             ],
+        },
+        "teleop.revo2_left_locked": {
+            "dtype": "int32",
+            "shape": (1,),
+            "names": ["left_locked"],
+        },
+        "teleop.revo2_right_locked": {
+            "dtype": "int32",
+            "shape": (1,),
+            "names": ["right_locked"],
         },
         "teleop.planner_mode": {
             "dtype": "int32",

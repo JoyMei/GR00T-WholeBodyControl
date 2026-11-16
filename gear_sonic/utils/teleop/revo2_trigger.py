@@ -295,6 +295,60 @@ def _bounded_slew(previous: np.ndarray, target: np.ndarray, dt: float, rate: flo
     return previous + np.clip(target - previous, -step, step)
 
 
+def _freeze_locked_targets(
+    previous: np.ndarray,
+    target: np.ndarray,
+    locked: np.ndarray,
+    was_locked: np.ndarray,
+    held: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Freeze newly locked hands at their last slew-limited command."""
+
+    newly_locked = locked & ~was_locked
+    held = held.copy()
+    held[newly_locked] = previous[newly_locked]
+    effective_target = target.copy()
+    effective_target[locked] = held[locked]
+    return effective_target, held
+
+
+class Revo2GripGesture:
+    """Recognize one Grip press/release without stealing a modifier chord."""
+
+    def __init__(self, press_threshold: float = 0.6, release_threshold: float = 0.3) -> None:
+        if not 0.0 <= release_threshold < press_threshold <= 1.0:
+            raise ValueError("Grip thresholds must satisfy 0 <= release < press <= 1")
+        self.press_threshold = float(press_threshold)
+        self.release_threshold = float(release_threshold)
+        self.pressed = False
+        self.consumed = False
+
+    def update(self, value: float, *, consume: bool = False) -> bool:
+        """Return True once when an unconsumed Grip press is released."""
+
+        try:
+            grip = float(value)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(grip):
+            return False
+
+        if not self.pressed:
+            if grip >= self.press_threshold:
+                self.pressed = True
+                self.consumed = bool(consume)
+            return False
+
+        self.consumed = self.consumed or bool(consume)
+        if grip > self.release_threshold:
+            return False
+
+        should_toggle = not self.consumed
+        self.pressed = False
+        self.consumed = False
+        return should_toggle
+
+
 async def _close_client(sdk: Any, client: Any) -> None:
     import inspect
 
@@ -315,6 +369,7 @@ async def _run_revo2_owner(
     slew_per_s: float,
     command_period_s: float,
     command_speed: float,
+    hand_locks: Any,
 ) -> None:
     # Hardware-only dependencies stay in the child process so mapping/tests run
     # on Windows and on machines without the BrainCo SDK.
@@ -482,6 +537,8 @@ async def _run_revo2_owner(
         status.send(("ready", None))
         next_tick = time.monotonic()
         timeout_ns = int(deadman_s * 1e9)
+        held_array = previous_array.copy()
+        previous_lock_state = np.zeros(2, dtype=bool)
 
         while not stop.is_set():
             now_ns = time.monotonic_ns()
@@ -505,6 +562,16 @@ async def _run_revo2_owner(
                 with targets.get_lock():
                     target_delta = np.asarray(targets[:], dtype=np.float64).reshape(2, 6)
                 target = np.clip(baseline_array + target_delta, 0.0, 1.0)
+                with hand_locks.get_lock():
+                    lock_state = np.asarray(hand_locks[:], dtype=bool)
+                target, held_array = _freeze_locked_targets(
+                    previous_array,
+                    target,
+                    lock_state,
+                    previous_lock_state,
+                    held_array,
+                )
+                previous_lock_state = lock_state
                 with sequence.get_lock():
                     current_sequence = int(sequence.value)
                 limited = _bounded_slew(previous_array, target, command_period_s, slew_per_s)
@@ -630,6 +697,7 @@ class Revo2TriggerOutput:
         )
         ctx = mp.get_context("spawn")
         self._targets = ctx.Array("d", 2 * REVO2_CHANNEL_COUNT)
+        self._hand_locks = ctx.Array("b", 2)
         self._source_received_ns = ctx.Value("q", 0)
         self._sequence = ctx.Value("q", 0)
         self._enabled = ctx.Event()
@@ -650,6 +718,7 @@ class Revo2TriggerOutput:
                 float(slew_per_s),
                 float(command_period_s),
                 float(command_speed),
+                self._hand_locks,
             ),
         )
         self._child_status = child_status
@@ -731,11 +800,34 @@ class Revo2TriggerOutput:
     def current_mode(self) -> Revo2TriggerMode:
         return self.modes[self._mode_index]
 
+    @property
+    def hand_locks(self) -> tuple[bool, bool]:
+        with self._hand_locks.get_lock():
+            return bool(self._hand_locks[0]), bool(self._hand_locks[1])
+
+    @property
+    def any_hand_locked(self) -> bool:
+        return any(self.hand_locks)
+
+    def set_hand_locked(self, side: str, locked: bool) -> None:
+        """Lock one hand at its last slew-limited command position."""
+
+        if self._closed:
+            raise RuntimeError("Revo2 trigger owner is closed")
+        try:
+            index = ("left", "right").index(side)
+        except ValueError as exc:
+            raise ValueError("Revo2 hand side must be 'left' or 'right'") from exc
+        with self._hand_locks.get_lock():
+            self._hand_locks[index] = bool(locked)
+
     def cycle_mode(self) -> Revo2TriggerMode:
         """Select and return the next mode, wrapping after the final mode."""
 
         if self._closed:
             raise RuntimeError("Revo2 trigger owner is closed")
+        if self.any_hand_locked:
+            raise RuntimeError("cannot change Revo2 mode while a hand is locked")
         self._mode_index = (self._mode_index + 1) % len(self.modes)
         return self.current_mode
 

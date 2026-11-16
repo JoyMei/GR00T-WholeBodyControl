@@ -5,8 +5,10 @@ import pytest
 
 from gear_sonic.utils.teleop.revo2_trigger import (
     REVO2_CHANNEL_COUNT,
+    Revo2GripGesture,
     Revo2TriggerMode,
     Revo2TriggerOutput,
+    _freeze_locked_targets,
     bilateral_trigger_deltas,
     default_revo2_trigger_modes,
     encode_revo2_mode_name,
@@ -152,6 +154,54 @@ def test_mode_switch_requires_both_triggers_released():
     assert not revo2_triggers_released(0.0, float("nan"))
 
 
+def test_grip_gesture_toggles_on_release_and_consumes_chords():
+    gesture = Revo2GripGesture()
+
+    assert not gesture.update(0.7)
+    assert not gesture.update(0.5)
+    assert gesture.update(0.2)
+
+    assert not gesture.update(0.8)
+    assert not gesture.update(0.8, consume=True)
+    assert not gesture.update(0.0)
+
+
+def test_locked_target_freezes_only_selected_hand():
+    previous = np.array([[0.2] * 6, [0.3] * 6])
+    target = np.array([[0.8] * 6, [0.9] * 6])
+    held = np.zeros((2, 6))
+
+    effective, held = _freeze_locked_targets(
+        previous,
+        target,
+        np.array([True, False]),
+        np.array([False, False]),
+        held,
+    )
+    np.testing.assert_allclose(effective[0], previous[0])
+    np.testing.assert_allclose(effective[1], target[1])
+
+    next_target = np.array([[0.1] * 6, [0.7] * 6])
+    effective, held = _freeze_locked_targets(
+        effective,
+        next_target,
+        np.array([True, False]),
+        np.array([True, False]),
+        held,
+    )
+    np.testing.assert_allclose(effective[0], previous[0])
+    np.testing.assert_allclose(effective[1], next_target[1])
+
+    effective, _ = _freeze_locked_targets(
+        effective,
+        next_target,
+        np.array([False, False]),
+        np.array([True, False]),
+        held,
+    )
+    np.testing.assert_allclose(effective, next_target)
+
+
 def test_device_config_is_ordered_left_then_right(tmp_path):
     path = tmp_path / "revo2_devices.json"
     path.write_text(
@@ -271,4 +321,38 @@ def test_output_cycles_modes_and_wraps(tmp_path):
     assert output.cycle_mode().name == "pinch"
     assert output.cycle_mode().name == "point"
     assert output.cycle_mode().name == "all_fingers"
+    output.close()
+
+
+def test_output_tracks_independent_locks_and_blocks_mode_changes(tmp_path):
+    path = tmp_path / "revo2_devices.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"side": "left", "port": "/dev/left", "serial": "L", "slave_id": 126},
+                {"side": "right", "port": "/dev/right", "serial": "R", "slave_id": 127},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    output = Revo2TriggerOutput(
+        load_revo2_devices(path),
+        modes=default_revo2_trigger_modes(),
+    )
+
+    assert output.hand_locks == (False, False)
+    output.set_hand_locked("left", True)
+    assert output.hand_locks == (True, False)
+    assert output.any_hand_locked
+    with pytest.raises(RuntimeError, match="while a hand is locked"):
+        output.cycle_mode()
+
+    output.set_hand_locked("left", False)
+    output.set_hand_locked("right", True)
+    assert output.hand_locks == (False, True)
+    output.set_hand_locked("right", False)
+    assert output.cycle_mode().name == "pinch"
+
+    with pytest.raises(ValueError, match="side"):
+        output.set_hand_locked("middle", True)
     output.close()

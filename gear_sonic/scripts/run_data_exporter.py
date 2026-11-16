@@ -250,6 +250,8 @@ class GrootDataCollector:
         self.current_revo2_mode_name_utf8 = np.zeros(32, dtype=np.int32)
         self.current_revo2_mode_channels = np.zeros(6, dtype=np.float32)
         self.current_revo2_mode_offsets = np.zeros(6, dtype=np.float32)
+        self.current_revo2_left_locked = False
+        self.current_revo2_right_locked = False
 
         self._manager_toggle_dc = False
         self._manager_toggle_da = False
@@ -379,6 +381,10 @@ class GrootDataCollector:
             self.current_revo2_mode_offsets = (
                 data["revo2_mode_offsets"].flatten().astype(np.float32)
             )
+        if "revo2_left_locked" in data:
+            self.current_revo2_left_locked = self._extract_bool(data, "revo2_left_locked")
+        if "revo2_right_locked" in data:
+            self.current_revo2_right_locked = self._extract_bool(data, "revo2_right_locked")
 
         if self._extract_bool(data, "toggle_data_collection"):
             self._manager_toggle_dc = True
@@ -693,6 +699,12 @@ class GrootDataCollector:
         frame_data["teleop.revo2_mode_name_utf8"] = self.current_revo2_mode_name_utf8.copy()
         frame_data["teleop.revo2_mode_channels"] = self.current_revo2_mode_channels.copy()
         frame_data["teleop.revo2_mode_offsets"] = self.current_revo2_mode_offsets.copy()
+        frame_data["teleop.revo2_left_locked"] = np.array(
+            [self.current_revo2_left_locked], dtype=np.int32
+        )
+        frame_data["teleop.revo2_right_locked"] = np.array(
+            [self.current_revo2_right_locked], dtype=np.int32
+        )
 
         smpl_msg = self.latest_sonic_msg
         use_smpl = False

@@ -2091,7 +2091,7 @@ def run_pico_manager(
     #
     print(
         "Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy, "
-        "right stick click=next Revo2 mode"
+        "right stick click=next Revo2 mode, Grip=lock/unlock corresponding Revo2"
     )
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
@@ -2101,6 +2101,7 @@ def run_pico_manager(
     prev_toggle_da = False
     revo2_output = None
     revo2_last_source_timestamp_ns = 0
+    revo2_grip_gestures = None
 
     def submit_revo2_target(left_trigger: float, right_trigger: float) -> bool:
         nonlocal revo2_last_source_timestamp_ns
@@ -2129,6 +2130,7 @@ def run_pico_manager(
     try:
         if revo2_trigger:
             from gear_sonic.utils.teleop.revo2_trigger import (
+                Revo2GripGesture,
                 Revo2TriggerOutput,
                 encode_revo2_mode_name,
                 load_revo2_devices,
@@ -2153,6 +2155,10 @@ def run_pico_manager(
                 modes=trigger_modes,
             )
             revo2_output.start()
+            revo2_grip_gestures = {
+                "left": Revo2GripGesture(),
+                "right": Revo2GripGesture(),
+            }
             active_mode = revo2_output.current_mode
             print(
                 "[Manager] Revo2 Trigger output ready; "
@@ -2183,23 +2189,59 @@ def run_pico_manager(
                 _,
             ) = get_controller_inputs(reader, keyboard=keyboard)
 
-            # Revo2 always follows the physical PICO Triggers.  In keyboard
-            # mode the keyboard adapter intentionally reports zero triggers.
-            _, left_trigger, right_trigger, _, _ = get_controller_inputs(
-                reader, keyboard=None
-            )
+            # Revo2 always follows the physical PICO Triggers and Grips, even
+            # when keyboard input supplies the manager's mode controls.
+            (
+                _,
+                left_trigger,
+                right_trigger,
+                left_grip_revo2,
+                right_grip_revo2,
+            ) = get_controller_inputs(reader, keyboard=None)
 
             left_axis_click, right_axis_click = get_axis_clicks(reader, keyboard=keyboard)
 
-            if (
-                revo2_output is not None
-                and right_axis_click
-                and not prev_right_axis_click
-            ):
-                if not revo2_triggers_released(left_trigger, right_trigger):
-                    print(
-                        "[Revo2Trigger] mode switch ignored: release both Triggers first"
-                    )
+            if revo2_output is not None and revo2_grip_gestures is not None:
+                grip_values = {
+                    "left": left_grip_revo2,
+                    "right": right_grip_revo2,
+                }
+                trigger_values = {
+                    "left": left_trigger,
+                    "right": right_trigger,
+                }
+                for side in ("left", "right"):
+                    # Left Grip+A/B remains reserved for record/discard. Any face-button
+                    # chord consumes the Grip gesture to avoid an accidental lock toggle.
+                    consume = any((a_pressed, b_pressed, x_pressed, y_pressed))
+                    if not revo2_grip_gestures[side].update(grip_values[side], consume=consume):
+                        continue
+                    if current_mode == StreamMode.OFF:
+                        continue
+
+                    left_locked, right_locked = revo2_output.hand_locks
+                    currently_locked = left_locked if side == "left" else right_locked
+                    if currently_locked:
+                        side_released = revo2_triggers_released(
+                            trigger_values[side] if side == "left" else 0.0,
+                            trigger_values[side] if side == "right" else 0.0,
+                        )
+                        if not side_released:
+                            print(
+                                f"[Revo2Trigger] {side} unlock ignored: "
+                                f"release {side} Trigger first"
+                            )
+                            continue
+
+                    revo2_output.set_hand_locked(side, not currently_locked)
+                    state = "locked" if not currently_locked else "unlocked"
+                    print(f"[Revo2Trigger] {side} hand {state}")
+
+            if revo2_output is not None and right_axis_click and not prev_right_axis_click:
+                if revo2_output.any_hand_locked:
+                    print("[Revo2Trigger] mode switch ignored: unlock both hands first")
+                elif not revo2_triggers_released(left_trigger, right_trigger):
+                    print("[Revo2Trigger] mode switch ignored: release both Triggers first")
                 else:
                     active_mode = revo2_output.cycle_mode()
                     print(
@@ -2381,6 +2423,14 @@ def run_pico_manager(
                             revo2_output.current_mode.offsets.astype(np.float32)
                             if revo2_output is not None
                             else np.zeros(6, dtype=np.float32)
+                        ),
+                        "revo2_left_locked": np.array(
+                            [revo2_output.hand_locks[0] if revo2_output is not None else False],
+                            dtype=bool,
+                        ),
+                        "revo2_right_locked": np.array(
+                            [revo2_output.hand_locks[1] if revo2_output is not None else False],
+                            dtype=bool,
                         ),
                     },
                     topic="manager_state",
