@@ -119,6 +119,15 @@ class SonicDataExporterConfig:
     require_revo2_tactile: bool = True
     """Require fresh bilateral tactile data whenever Revo2 recording is enabled."""
 
+    oxt_raw_output_dir: str | None = None
+    """Optional independent OXT raw-session root; disabled by default."""
+
+    oxt_session_id: str | None = None
+    """Optional OXT session ID. Existing session paths are never overwritten."""
+
+    oxt_raw_queue_size: int = 8192
+    """Bounded OXT writer queue; overflow is recorded as a capture fault."""
+
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
 
@@ -249,6 +258,8 @@ class GrootDataCollector:
         record_revo2: bool = False,
         revo2_max_age_ms: float = 200.0,
         require_revo2_tactile: bool = True,
+        oxt_capture=None,
+        oxt_task_prompt: str = "demo",
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -260,6 +271,8 @@ class GrootDataCollector:
             raise ValueError("revo2_max_age_ms must be finite and within [20, 2000]")
         self.revo2_max_age_ns = int(revo2_max_age_ms * 1e6)
         self.require_revo2_tactile = bool(require_revo2_tactile)
+        self.oxt_capture = oxt_capture
+        self.oxt_task_prompt = str(oxt_task_prompt)
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
@@ -358,15 +371,31 @@ class GrootDataCollector:
             self._episode_state.change_state()
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
+                if self.oxt_capture is not None:
+                    self.oxt_capture.begin_episode(
+                        episode_index=self.current_episode_index,
+                        task=self.oxt_task_prompt,
+                    )
                 self._print_and_say(
                     f"Started recording {self.current_episode_index}", blocking=False
                 )
             elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
+                if self.oxt_capture is not None:
+                    buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+                    self.oxt_capture.finish_episode(
+                        "episode_complete" if buffer_size > 0 else "episode_discard",
+                        episode_index=self.current_episode_index,
+                    )
                 self._print_and_say("Stopping recording, preparing to save", blocking=False)
             elif self._episode_state.get_state() == self._episode_state.IDLE:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
+                if self.oxt_capture is not None:
+                    self.oxt_capture.finish_episode(
+                        "episode_discard",
+                        episode_index=self.current_episode_index,
+                    )
                 self.data_exporter.save_episode_as_discarded()
                 self._episode_state.reset_state()
                 self._initial_yaw = None
@@ -923,6 +952,13 @@ class GrootDataCollector:
         return quat_to_rot6d(target_quat)
 
     def save_and_cleanup(self):
+        if self.oxt_capture is not None:
+            try:
+                session_path = self.oxt_capture.close()
+                self._print_and_say(f"OXT raw session closed: {session_path}", say=False)
+            except Exception as exc:
+                self._print_and_say(f"OXT raw session close failed: {exc}", say=False)
+
         try:
             self._print_and_say("saving episode done", blocking=False)
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
@@ -967,7 +1003,13 @@ class GrootDataCollector:
                     with self.telemetry.timer("poll_image"):
                         img_msg = self._image_subscriber.read()
                         if img_msg is not None:
+                            is_new_image_message = self.latest_image_msg is not img_msg
                             self.latest_image_msg = img_msg
+                            if is_new_image_message and self.oxt_capture is not None:
+                                self.oxt_capture.capture_camera_message(
+                                    img_msg,
+                                    received_monotonic_ns=time.monotonic_ns(),
+                                )
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()
@@ -990,6 +1032,12 @@ class GrootDataCollector:
         except KeyboardInterrupt:
             print("Data exporter terminated by user")
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+            if self.oxt_capture is not None:
+                self.oxt_capture.finish_episode(
+                    "episode_abort",
+                    episode_index=self.current_episode_index,
+                    metadata={"reason": "collector_keyboard_interrupt"},
+                )
             if buffer_size > 0:
                 self.data_exporter.save_episode_as_discarded()
 
@@ -1058,6 +1106,25 @@ def main(config: SonicDataExporterConfig):
         },
     )
 
+    oxt_capture = None
+    if config.oxt_raw_output_dir:
+        from gear_sonic.utils.data_collection.oxt_raw import OxtCaptureRuntime
+
+        oxt_capture = OxtCaptureRuntime(
+            config.oxt_raw_output_dir,
+            session_id=config.oxt_session_id,
+            sonic_zmq_host=config.sonic_zmq_host,
+            sonic_zmq_port=config.sonic_zmq_port,
+            state_zmq_host=config.state_zmq_host,
+            state_zmq_port=config.state_zmq_port,
+            queue_size=config.oxt_raw_queue_size,
+            metadata={
+                "task_prompt_default": config.task_prompt,
+                "record_revo2_snapshot_requested": config.record_revo2,
+            },
+        ).start()
+        print(f"[OXT] Raw capture session: {oxt_capture.session_root}")
+
     data_collector = GrootDataCollector(
         frequency=config.data_collection_frequency,
         data_exporter=data_exporter,
@@ -1072,6 +1139,8 @@ def main(config: SonicDataExporterConfig):
         record_revo2=config.record_revo2,
         revo2_max_age_ms=config.revo2_max_age_ms,
         require_revo2_tactile=config.require_revo2_tactile,
+        oxt_capture=oxt_capture,
+        oxt_task_prompt=config.task_prompt,
     )
     data_collector.run()
 

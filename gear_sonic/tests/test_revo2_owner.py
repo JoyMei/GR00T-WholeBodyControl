@@ -1,6 +1,8 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from gear_sonic.utils.teleop.revo2_data import (
     REVO2_TOUCH_CAPACITIVE,
     REVO2_TOUCH_PRESSURE_SUMMARY,
@@ -54,13 +56,20 @@ class _FakeSdk:
 
 
 class _FakeClient:
-    def __init__(self, *, pressure, enabled_mask):
+    def __init__(self, *, pressure, enabled_mask, unsupported_touch_type=None):
         self.pressure = pressure
         self.enabled_mask = enabled_mask
+        self.unsupported_touch_type = unsupported_touch_type
         self.setup_masks = []
 
     async def uses_pressure_touch_api(self, slave_id):
         return self.pressure
+
+    async def uses_array_pressure_touch_api(self, slave_id):
+        return self.unsupported_touch_type == "ArrayPressure"
+
+    async def uses_force3d_touch_api(self, slave_id):
+        return self.unsupported_touch_type == "Force3D"
 
     async def get_touch_sensor_enabled(self, slave_id):
         return self.enabled_mask
@@ -87,7 +96,11 @@ def test_capacitive_collector_reuses_control_client_without_configuration_write(
             _FakeSdk,
             client,
             _device(),
-            SimpleNamespace(is_touch=lambda: True),
+            SimpleNamespace(
+                is_touch=lambda: True,
+                uses_revo2_touch_api=lambda: True,
+                hardware_type="Revo2Touch",
+            ),
             frequency=20,
             touch_setup=False,
         )
@@ -109,7 +122,11 @@ def test_pressure_collector_preserves_summary_and_detailed_streams():
             _FakeSdk,
             client,
             _device(),
-            SimpleNamespace(uses_revo2_touch_api=lambda: True),
+            SimpleNamespace(
+                is_touch=lambda: True,
+                uses_revo2_touch_api=lambda: False,
+                hardware_type="Revo2TouchPressure",
+            ),
             frequency=20,
             touch_setup=False,
         )
@@ -133,6 +150,11 @@ def test_touch_detection_checks_both_supported_sdk_properties():
 
 def test_touch_setup_requires_explicit_opt_in():
     client = _FakeClient(pressure=False, enabled_mask=0)
+    info = SimpleNamespace(
+        is_touch=True,
+        uses_revo2_touch_api=True,
+        hardware_type="Revo2Touch",
+    )
 
     try:
         asyncio.run(
@@ -140,7 +162,7 @@ def test_touch_setup_requires_explicit_opt_in():
                 _FakeSdk,
                 client,
                 _device(),
-                SimpleNamespace(is_touch=True),
+                info,
                 frequency=20,
                 touch_setup=False,
             )
@@ -155,13 +177,65 @@ def test_touch_setup_requires_explicit_opt_in():
             _FakeSdk,
             client,
             _device(),
-            SimpleNamespace(is_touch=True),
+            info,
             frequency=20,
             touch_setup=True,
         )
     )
     assert resource["collector"].mode == "capacitive"
     assert client.setup_masks == [0x1F]
+
+
+@pytest.mark.parametrize("touch_type", ["Force3D", "ArrayPressure"])
+def test_unsupported_touch_types_fail_before_collector_creation(touch_type):
+    _CollectorFactory.calls.clear()
+    client = _FakeClient(
+        pressure=False,
+        enabled_mask=0x3F,
+        unsupported_touch_type=touch_type,
+    )
+
+    with pytest.raises(RuntimeError, match=f"{touch_type}.*dedicated OXT schema"):
+        asyncio.run(
+            _create_data_collector(
+                _FakeSdk,
+                client,
+                _device(),
+                SimpleNamespace(
+                    is_touch=True,
+                    uses_revo2_touch_api=False,
+                    hardware_type=f"Revo2Touch{touch_type}",
+                ),
+                frequency=20,
+                touch_setup=True,
+            )
+        )
+
+    assert _CollectorFactory.calls == []
+    assert client.setup_masks == []
+
+
+def test_unknown_touch_type_does_not_fall_back_to_capacitive():
+    _CollectorFactory.calls.clear()
+    client = _FakeClient(pressure=False, enabled_mask=0x1F)
+
+    with pytest.raises(RuntimeError, match="no supported tactile API.*generic capacitive"):
+        asyncio.run(
+            _create_data_collector(
+                _FakeSdk,
+                client,
+                _device(),
+                SimpleNamespace(
+                    is_touch=True,
+                    uses_revo2_touch_api=False,
+                    hardware_type="Revo2TouchFutureVariant",
+                ),
+                frequency=20,
+                touch_setup=False,
+            )
+        )
+
+    assert _CollectorFactory.calls == []
 
 
 def test_slew_cannot_exceed_command_speed():
