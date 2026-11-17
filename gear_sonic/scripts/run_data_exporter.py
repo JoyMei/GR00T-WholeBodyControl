@@ -17,6 +17,7 @@ Virtual environment setup (run from repo root):
 Usage (from repo root):
     python gear_sonic/scripts/run_data_exporter.py --task-prompt "pick up the cup"
     python gear_sonic/scripts/run_data_exporter.py --task-prompt "walk forward" --dataset-name my_session
+    python gear_sonic/scripts/run_data_exporter.py --oxt-only --oxt-raw-output-dir /data/oxt/demo
 """
 
 from collections import deque
@@ -122,6 +123,12 @@ class SonicDataExporterConfig:
     oxt_raw_output_dir: str | None = None
     """Optional independent OXT raw-session root; disabled by default."""
 
+    oxt_only: bool = False
+    """Write OXT raw only; do not create or write a LeRobot dataset."""
+
+    allow_unbenchmarked_dual_capture: bool = False
+    """Explicitly allow OXT raw and LeRobot output in one process before latency qualification."""
+
     oxt_session_id: str | None = None
     """Optional OXT session ID. Existing session paths are never overwritten."""
 
@@ -143,6 +150,31 @@ class TimeDeltaException(Exception):
         self.reset_timeout_sec = reset_timeout_sec
         self.message = f"{self.failure_count} failures in {self.reset_timeout_sec} seconds"
         super().__init__(self.message)
+
+
+def validate_capture_mode_config(config: SonicDataExporterConfig) -> None:
+    if config.oxt_only:
+        if not config.oxt_raw_output_dir:
+            raise ValueError("--oxt-raw-output-dir is required with --oxt-only")
+        if config.allow_unbenchmarked_dual_capture:
+            raise ValueError(
+                "--allow-unbenchmarked-dual-capture cannot be combined with --oxt-only"
+            )
+        if config.record_revo2:
+            raise ValueError(
+                "--record-revo2 is a LeRobot snapshot option; OXT raw is captured separately"
+            )
+        if config.record_wrist_cameras:
+            raise ValueError(
+                "--record-wrist-cameras is a LeRobot schema option and is unavailable in OXT-only mode"
+            )
+    elif config.oxt_raw_output_dir and not config.allow_unbenchmarked_dual_capture:
+        raise ValueError(
+            "OXT + LeRobot dual capture is not latency-qualified; use --oxt-only or "
+            "explicitly pass --allow-unbenchmarked-dual-capture after reviewing the risk"
+        )
+    elif config.allow_unbenchmarked_dual_capture and not config.oxt_raw_output_dir:
+        raise ValueError("--allow-unbenchmarked-dual-capture requires --oxt-raw-output-dir")
 
 
 def unpack_pose_message(packed_data: bytes, topic: str = "pose") -> dict:
@@ -260,6 +292,7 @@ class GrootDataCollector:
         require_revo2_tactile: bool = True,
         oxt_capture=None,
         oxt_task_prompt: str = "demo",
+        oxt_only: bool = False,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -273,6 +306,12 @@ class GrootDataCollector:
         self.require_revo2_tactile = bool(require_revo2_tactile)
         self.oxt_capture = oxt_capture
         self.oxt_task_prompt = str(oxt_task_prompt)
+        self.oxt_only = bool(oxt_only)
+        self._oxt_episode_index = 0
+        if self.oxt_only and (self.oxt_capture is None or data_exporter is not None):
+            raise ValueError("OXT-only mode requires an OXT capture and no LeRobot exporter")
+        if not self.oxt_only and data_exporter is None:
+            raise ValueError("LeRobot exporter is required unless OXT-only mode is enabled")
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
@@ -295,9 +334,10 @@ class GrootDataCollector:
         self._manager_toggle_dc = False
         self._manager_toggle_da = False
 
-        self._state_subscriber = ZMQStateSubscriber(
-            host=state_zmq_host,
-            port=state_zmq_port,
+        self._state_subscriber = (
+            None
+            if self.oxt_only
+            else ZMQStateSubscriber(host=state_zmq_host, port=state_zmq_port)
         )
 
         self._sonic_zmq_ctx = None
@@ -309,14 +349,17 @@ class GrootDataCollector:
             self._sonic_zmq_socket.setsockopt(zmq.RCVTIMEO, 100)
             self._sonic_zmq_socket.setsockopt(zmq.CONFLATE, 0)
             self._sonic_zmq_socket.setsockopt(zmq.RCVHWM, 20)
-            self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "pose")
-            self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "planner")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
+            if not self.oxt_only:
+                self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "pose")
+                self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "planner")
             if self.record_revo2:
                 self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "revo2_state")
             time.sleep(0.5)
             print(f"[Sonic] Connected to ZMQ at {sonic_data_zmq_host}:{sonic_data_zmq_port}")
-            topics = ["pose", "planner", "manager_state"]
+            topics = ["manager_state"]
+            if not self.oxt_only:
+                topics.extend(["pose", "planner"])
             if self.record_revo2:
                 topics.append("revo2_state")
             print(f"[Sonic] Subscribed to: {', '.join(topics)}")
@@ -333,10 +376,15 @@ class GrootDataCollector:
         self._last_revo2_wait_log_time = 0.0
         self._initial_yaw = None
 
-        print(f"Recording to {self.data_exporter.meta.root}")
+        if self.oxt_only:
+            print("[OXT] OXT-only mode; LeRobot output is disabled")
+        else:
+            print(f"Recording to {self.data_exporter.meta.root}")
 
     @property
     def current_episode_index(self):
+        if self.data_exporter is None:
+            return self._oxt_episode_index
         return self.data_exporter.episode_buffer["episode_index"]
 
     def _print_and_say(self, message: str, say: bool = True, blocking: bool = False):
@@ -347,6 +395,8 @@ class GrootDataCollector:
 
     def _poll_state_zmq(self):
         """Poll the ``g1_debug`` ZMQ topic for robot state (non-blocking)."""
+        if self._state_subscriber is None:
+            return
         msg = self._state_subscriber.get_msg(clear=True)
         if msg is None:
             return
@@ -377,9 +427,26 @@ class GrootDataCollector:
                         task=self.oxt_task_prompt,
                     )
                 self._print_and_say(
-                    f"Started recording {self.current_episode_index}", blocking=False
+                    (
+                        f"Started OXT raw episode {self.current_episode_index}"
+                        if self.oxt_only
+                        else f"Started recording {self.current_episode_index}"
+                    ),
+                    blocking=False,
                 )
             elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
+                if self.oxt_only:
+                    self.oxt_capture.finish_episode(
+                        "episode_complete",
+                        episode_index=self.current_episode_index,
+                    )
+                    self._print_and_say(
+                        f"Finished OXT raw episode {self.current_episode_index}", say=False
+                    )
+                    self._oxt_episode_index += 1
+                    self._initial_yaw = None
+                    self._episode_state.reset_state()
+                    return
                 if self.oxt_capture is not None:
                     buffer_size = self.data_exporter.episode_buffer.get("size", 0)
                     self.oxt_capture.finish_episode(
@@ -396,7 +463,13 @@ class GrootDataCollector:
                         "episode_discard",
                         episode_index=self.current_episode_index,
                     )
-                self.data_exporter.save_episode_as_discarded()
+                if self.data_exporter is not None:
+                    self.data_exporter.save_episode_as_discarded()
+                if self.oxt_only:
+                    self._print_and_say(
+                        f"Discarded OXT raw episode {self.current_episode_index}", say=False
+                    )
+                    self._oxt_episode_index += 1
                 self._episode_state.reset_state()
                 self._initial_yaw = None
                 self._print_and_say("Discarded episode", blocking=False)
@@ -959,21 +1032,23 @@ class GrootDataCollector:
             except Exception as exc:
                 self._print_and_say(f"OXT raw session close failed: {exc}", say=False)
 
-        try:
-            self._print_and_say("saving episode done", blocking=False)
-            buffer_size = self.data_exporter.episode_buffer.get("size", 0)
-            if buffer_size > 0:
-                self.data_exporter.save_episode()
-            self._print_and_say(
-                f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
-            )
-        except Exception as e:
-            self._print_and_say(f"Error saving episode: {e}", blocking=True)
+        if self.data_exporter is not None:
+            try:
+                self._print_and_say("saving episode done", blocking=False)
+                buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+                if buffer_size > 0:
+                    self.data_exporter.save_episode()
+                self._print_and_say(
+                    f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
+                )
+            except Exception as e:
+                self._print_and_say(f"Error saving episode: {e}", blocking=True)
 
-        try:
-            self._state_subscriber.close()
-        except Exception:
-            pass
+        if self._state_subscriber is not None:
+            try:
+                self._state_subscriber.close()
+            except Exception:
+                pass
         for sock in [self._sonic_zmq_socket]:
             if sock is not None:
                 try:
@@ -987,15 +1062,21 @@ class GrootDataCollector:
                 except Exception:
                     pass
 
-        self._print_and_say("Shutting down data exporter...", say=False)
+        shutdown_message = (
+            "Shutting down OXT raw collector..."
+            if self.oxt_only
+            else "Shutting down data exporter..."
+        )
+        self._print_and_say(shutdown_message, say=False)
 
     def run(self):
         try:
             while True:
                 t_start = time.monotonic()
                 with self.telemetry.timer("total_loop"):
-                    with self.telemetry.timer("poll_state"):
-                        self._poll_state_zmq()
+                    if not self.oxt_only:
+                        with self.telemetry.timer("poll_state"):
+                            self._poll_state_zmq()
 
                     with self.telemetry.timer("poll_sonic"):
                         self._poll_sonic_zmq_messages()
@@ -1011,8 +1092,9 @@ class GrootDataCollector:
                                     received_monotonic_ns=time.monotonic_ns(),
                                 )
 
-                    with self.telemetry.timer("add_frame"):
-                        self._add_data_frame()
+                    if not self.oxt_only:
+                        with self.telemetry.timer("add_frame"):
+                            self._add_data_frame()
 
                     with self.telemetry.timer("check_recording_commands"):
                         self._check_recording_commands()
@@ -1030,15 +1112,23 @@ class GrootDataCollector:
                     )
 
         except KeyboardInterrupt:
-            print("Data exporter terminated by user")
-            buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+            print(
+                "OXT raw collector terminated by user"
+                if self.oxt_only
+                else "Data exporter terminated by user"
+            )
             if self.oxt_capture is not None:
                 self.oxt_capture.finish_episode(
                     "episode_abort",
                     episode_index=self.current_episode_index,
                     metadata={"reason": "collector_keyboard_interrupt"},
                 )
-            if buffer_size > 0:
+            buffer_size = (
+                self.data_exporter.episode_buffer.get("size", 0)
+                if self.data_exporter is not None
+                else 0
+            )
+            if self.data_exporter is not None and buffer_size > 0:
                 self.data_exporter.save_episode_as_discarded()
 
         finally:
@@ -1051,60 +1141,66 @@ class GrootDataCollector:
 
 
 def main(config: SonicDataExporterConfig):
-    g1_rm = get_g1_robot_model()
+    validate_capture_mode_config(config)
 
-    dataset_features = get_features_sonic_vla(g1_rm)
-    modality_config = get_modality_config_sonic_vla(g1_rm)
-
-    if config.record_wrist_cameras:
-        print("[Camera] Wrist cameras enabled — adding to dataset schema")
-        dataset_features.update(get_wrist_camera_features())
-        wrist_modality = get_wrist_camera_modality_config()
-        for key, value in wrist_modality.items():
-            if key in modality_config:
-                modality_config[key].update(value)
-            else:
-                modality_config[key] = value
-
+    g1_rm = None
+    data_exporter = None
     revo2_metadata = None
-    if config.record_revo2:
-        if not config.revo2_devices:
-            raise ValueError("revo2_devices is required when Revo2 recording is enabled")
-        from gear_sonic.utils.teleop.revo2_trigger import load_revo2_devices
+    text_to_speech = None
+    if not config.oxt_only:
+        g1_rm = get_g1_robot_model()
+        dataset_features = get_features_sonic_vla(g1_rm)
+        modality_config = get_modality_config_sonic_vla(g1_rm)
 
-        revo2_metadata = revo2_capture_metadata(
-            load_revo2_devices(config.revo2_devices)
-        )
-        print("[Revo2] Measured motor, command, and tactile fields enabled")
-        dataset_features.update(get_revo2_features())
-        revo2_modality = get_revo2_modality_config()
-        for key, value in revo2_modality.items():
-            if key in modality_config:
-                modality_config[key].update(value)
-            else:
-                modality_config[key] = value
+        if config.record_wrist_cameras:
+            print("[Camera] Wrist cameras enabled — adding to dataset schema")
+            dataset_features.update(get_wrist_camera_features())
+            wrist_modality = get_wrist_camera_modality_config()
+            for key, value in wrist_modality.items():
+                if key in modality_config:
+                    modality_config[key].update(value)
+                else:
+                    modality_config[key] = value
 
-    text_to_speech = TextToSpeech() if config.text_to_speech else None
+        if config.record_revo2:
+            if not config.revo2_devices:
+                raise ValueError("revo2_devices is required when Revo2 recording is enabled")
+            from gear_sonic.utils.teleop.revo2_trigger import load_revo2_devices
+
+            revo2_metadata = revo2_capture_metadata(
+                load_revo2_devices(config.revo2_devices)
+            )
+            print("[Revo2] Measured motor, command, and tactile fields enabled")
+            dataset_features.update(get_revo2_features())
+            revo2_modality = get_revo2_modality_config()
+            for key, value in revo2_modality.items():
+                if key in modality_config:
+                    modality_config[key].update(value)
+                else:
+                    modality_config[key] = value
+
+        text_to_speech = TextToSpeech() if config.text_to_speech else None
 
     robot_config = poll_robot_config_zmq(
         config.state_zmq_host, config.state_zmq_port, config.robot_config_timeout
     )
 
-    data_exporter = Gr00tDataExporter.create(
-        save_root=f"{config.root_output_dir}/{config.dataset_name}",
-        fps=config.data_collection_frequency,
-        features=dataset_features,
-        modality_config=modality_config,
-        task=config.task_prompt,
-        script_config={
-            **robot_config,
-            "record_wrist_cameras": config.record_wrist_cameras,
-            "record_revo2": config.record_revo2,
-            "revo2_capture": revo2_metadata,
-            "revo2_max_age_ms": config.revo2_max_age_ms,
-            "require_revo2_tactile": config.require_revo2_tactile,
-        },
-    )
+    if not config.oxt_only:
+        data_exporter = Gr00tDataExporter.create(
+            save_root=f"{config.root_output_dir}/{config.dataset_name}",
+            fps=config.data_collection_frequency,
+            features=dataset_features,
+            modality_config=modality_config,
+            task=config.task_prompt,
+            script_config={
+                **robot_config,
+                "record_wrist_cameras": config.record_wrist_cameras,
+                "record_revo2": config.record_revo2,
+                "revo2_capture": revo2_metadata,
+                "revo2_max_age_ms": config.revo2_max_age_ms,
+                "require_revo2_tactile": config.require_revo2_tactile,
+            },
+        )
 
     oxt_capture = None
     if config.oxt_raw_output_dir:
@@ -1121,6 +1217,7 @@ def main(config: SonicDataExporterConfig):
             metadata={
                 "task_prompt_default": config.task_prompt,
                 "record_revo2_snapshot_requested": config.record_revo2,
+                "oxt_only": config.oxt_only,
             },
         ).start()
         print(f"[OXT] Raw capture session: {oxt_capture.session_root}")
@@ -1141,6 +1238,7 @@ def main(config: SonicDataExporterConfig):
         require_revo2_tactile=config.require_revo2_tactile,
         oxt_capture=oxt_capture,
         oxt_task_prompt=config.task_prompt,
+        oxt_only=config.oxt_only,
     )
     data_collector.run()
 
