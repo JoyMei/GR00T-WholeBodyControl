@@ -22,13 +22,15 @@
 
 """
 
-from collections import defaultdict, deque
-from contextlib import ExitStack
-from enum import Enum, IntEnum
+import json
 import os
 import subprocess
 import threading
 import time
+from collections import defaultdict, deque
+from contextlib import ExitStack
+from enum import Enum, IntEnum
+from pathlib import Path
 
 import msgpack
 import numpy as np
@@ -37,9 +39,6 @@ import zmq
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Rotation as sRot
 
-from gear_sonic.utils.teleop import input_readers
-from gear_sonic.utils.teleop.keyboard_input import KeyboardControlSource
-from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
     angle_axis_to_quaternion,
@@ -49,6 +48,10 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_angle_axis,
     quaternion_to_rotation_matrix,
 )
+from gear_sonic.utils.teleop import input_readers
+from gear_sonic.utils.teleop.keyboard_input import KeyboardControlSource
+from gear_sonic.utils.teleop.revo2_data import revo2_state_to_wire
+from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 
 try:
     from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -645,6 +648,47 @@ def get_controller_inputs(reader=None, keyboard=None):
     right_grip = xrt.get_right_grip()
     left_menu_button = xrt.get_left_menu_button()
     return left_menu_button, left_trigger, right_trigger, left_grip, right_grip
+
+
+def get_revo2_trigger_sample(reader=None):
+    """Return physical triggers with their source sequence and host receive time."""
+
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return None
+        source_timestamp_ns = int(ctrl.get("source_timestamp_ns", 0))
+        received_monotonic_ns = int(ctrl.get("received_monotonic_ns", 0))
+        if source_timestamp_ns <= 0 or received_monotonic_ns <= 0:
+            return None
+        return (
+            float(ctrl.get("left_trigger_value", 0.0)),
+            float(ctrl.get("right_trigger_value", 0.0)),
+            source_timestamp_ns,
+            received_monotonic_ns,
+            float(ctrl.get("left_squeeze_value", 0.0)),
+            float(ctrl.get("right_squeeze_value", 0.0)),
+        )
+    if xrt is None:
+        return None
+    for _ in range(2):
+        timestamp_before_ns = int(xrt.get_time_stamp_ns())
+        left_trigger = float(xrt.get_left_trigger())
+        right_trigger = float(xrt.get_right_trigger())
+        left_grip = float(xrt.get_left_grip())
+        right_grip = float(xrt.get_right_grip())
+        source_timestamp_ns = int(xrt.get_time_stamp_ns())
+        received_monotonic_ns = time.monotonic_ns()
+        if source_timestamp_ns > 0 and source_timestamp_ns == timestamp_before_ns:
+            return (
+                left_trigger,
+                right_trigger,
+                source_timestamp_ns,
+                received_monotonic_ns,
+                left_grip,
+                right_grip,
+            )
+    return None
 
 
 def get_controller_axes(reader=None, keyboard=None):
@@ -1967,6 +2011,7 @@ def run_pico_manager(
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
     control_source: str = "controller",
+    control_arm_file: str | None = None,
     keyboard_ttl_sec: float = 0.32,
     keyboard_a: str = "a",
     keyboard_b: str = "b",
@@ -1985,11 +2030,15 @@ def run_pico_manager(
     revo2_devices: str | None = None,
     revo2_modes: str | None = None,
     revo2_deadman_s: float = 0.3,
-    revo2_slew_per_s: float = 0.4,
+    revo2_slew_per_s: float = 0.2,
     revo2_command_period_s: float = 0.04,
     revo2_thumb_delta: float = 0.15,
     revo2_finger_delta: float = 0.20,
     revo2_command_speed: float = 0.25,
+    revo2_capture_data: bool = False,
+    revo2_capture_raw_data: bool = False,
+    revo2_data_rate_hz: float = 20.0,
+    revo2_touch_setup: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2001,7 +2050,17 @@ def run_pico_manager(
         raise ValueError("control_source must be 'controller' or 'keyboard'")
     if revo2_trigger and not revo2_devices:
         raise ValueError("revo2_devices is required when Revo2 Trigger output is enabled")
-
+    if revo2_capture_data and not revo2_trigger:
+        raise ValueError("revo2_capture_data requires Revo2 Trigger output")
+    if revo2_capture_raw_data and not revo2_trigger:
+        raise ValueError("revo2_capture_raw_data requires Revo2 Trigger output")
+    if revo2_touch_setup and not (revo2_capture_data or revo2_capture_raw_data):
+        raise ValueError("revo2_touch_setup requires Revo2 data capture")
+    control_arm_path = (
+        Path(control_arm_file).expanduser().resolve() if control_arm_file else None
+    )
+    if control_arm_path is not None:
+        print(f"[Manager] Control input locked; waiting for arm file: {control_arm_path}")
     reader = _init_input_source(input_source, buffer_size)
     keyboard = None
     if control_source == "keyboard":
@@ -2101,32 +2160,96 @@ def run_pico_manager(
     prev_toggle_dc = False
     prev_toggle_da = False
     revo2_output = None
-    revo2_last_source_timestamp_ns = 0
+    revo2_last_source_sequence = 0
+    revo2_last_source_received_ns = 0
+    revo2_last_published_ns = 0
+    revo2_last_raw_dropped = 0
+    revo2_raw_relay_dropped = 0
+    revo2_last_raw_relay_reported = 0
     revo2_grip_gestures = None
 
-    def submit_revo2_target(left_trigger: float, right_trigger: float) -> bool:
-        nonlocal revo2_last_source_timestamp_ns
-        if revo2_output is None:
+    def submit_revo2_target(trigger_sample) -> bool:
+        nonlocal revo2_last_source_received_ns, revo2_last_source_sequence
+        if revo2_output is None or trigger_sample is None:
             return False
-        sample = reader.get_latest()
-        if sample is None:
-            return False
-        source_timestamp_ns = int(sample.get("timestamp_ns", 0))
-        if source_timestamp_ns <= revo2_last_source_timestamp_ns:
-            return revo2_last_source_timestamp_ns > 0
-        source_received_monotonic_ns = int(
-            float(sample.get("timestamp_monotonic", time.monotonic())) * 1e9
+        left_trigger, right_trigger, source_sequence, source_received_monotonic_ns = (
+            trigger_sample[:4]
         )
         source_age_ns = time.monotonic_ns() - source_received_monotonic_ns
         if not 0 <= source_age_ns <= int(revo2_deadman_s * 1e9):
             return False
+        if source_sequence <= revo2_last_source_sequence:
+            accepted_age_ns = time.monotonic_ns() - revo2_last_source_received_ns
+            return 0 <= accepted_age_ns <= int(revo2_deadman_s * 1e9)
         revo2_output.submit_triggers(
             left_trigger,
             right_trigger,
+            source_sequence=source_sequence,
             source_received_monotonic_ns=source_received_monotonic_ns,
         )
-        revo2_last_source_timestamp_ns = source_timestamp_ns
+        revo2_last_source_sequence = source_sequence
+        revo2_last_source_received_ns = source_received_monotonic_ns
         return True
+
+    def publish_revo2_raw_events() -> None:
+        nonlocal revo2_last_raw_dropped, revo2_raw_relay_dropped
+        nonlocal revo2_last_raw_relay_reported
+        if revo2_output is None or not revo2_capture_raw_data:
+            return
+
+        def send_raw(topic: bytes, payload: bytes) -> bool:
+            nonlocal revo2_raw_relay_dropped
+            try:
+                socket.send(topic + payload, flags=zmq.NOBLOCK)
+            except zmq.Again:
+                revo2_raw_relay_dropped += 1
+                return False
+            return True
+
+        while True:
+            raw_events = revo2_output.get_raw_samples(max_items=64)
+            if not raw_events:
+                break
+            for raw_event in raw_events:
+                send_raw(
+                    b"revo2_raw",
+                    json.dumps(
+                        raw_event,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8"),
+                )
+        raw_dropped = revo2_output.raw_dropped
+        if (
+            raw_dropped > revo2_last_raw_dropped
+            or revo2_raw_relay_dropped > revo2_last_raw_relay_reported
+        ):
+            if send_raw(
+                b"revo2_raw_drop",
+                json.dumps(
+                    {
+                        "schema_revision": "revo2-native-raw-v1",
+                        "owner_dropped_total": raw_dropped,
+                        "owner_dropped_since_last_report": raw_dropped
+                        - revo2_last_raw_dropped,
+                        "relay_dropped_total": revo2_raw_relay_dropped,
+                        "relay_dropped_since_last_report": revo2_raw_relay_dropped
+                        - revo2_last_raw_relay_reported,
+                        "received_monotonic_ns": time.monotonic_ns(),
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8"),
+            ):
+                revo2_last_raw_dropped = raw_dropped
+                revo2_last_raw_relay_reported = revo2_raw_relay_dropped
+
+    def close_revo2_owner() -> None:
+        if revo2_output is not None:
+            revo2_output.close()
+            publish_revo2_raw_events()
 
     try:
         if revo2_trigger:
@@ -2153,6 +2276,10 @@ def run_pico_manager(
                 thumb_delta=revo2_thumb_delta,
                 finger_delta=revo2_finger_delta,
                 command_speed=revo2_command_speed,
+                capture_data=revo2_capture_data,
+                capture_raw_data=revo2_capture_raw_data,
+                data_rate_hz=revo2_data_rate_hz,
+                touch_setup=revo2_touch_setup,
                 modes=trigger_modes,
             )
             revo2_output.start()
@@ -2160,19 +2287,31 @@ def run_pico_manager(
                 "left": Revo2GripGesture(),
                 "right": Revo2GripGesture(),
             }
-            active_mode = revo2_output.current_mode
             print(
                 "[Manager] Revo2 Trigger output ready; "
-                f"mode 1/{len(revo2_output.modes)}: {active_mode.name}; "
-                f"channels={active_mode.channels.round(3).tolist()}; "
-                f"offsets={active_mode.offsets.round(3).tolist()}"
+                f"mode 1/{len(revo2_output.modes)}: "
+                f"{revo2_output.current_mode.name}; "
+                f"channels={revo2_output.current_mode.channels.round(3).tolist()}; "
+                f"offsets={revo2_output.current_mode.offsets.round(3).tolist()}"
             )
+            if revo2_capture_data:
+                print(
+                    "[Manager] Revo2 data capture ready; "
+                    f"rate={revo2_data_rate_hz:.1f}Hz metadata={revo2_output.metadata}"
+                )
+            if revo2_capture_raw_data:
+                print(
+                    "[Manager] Revo2 native raw relay ready; "
+                    f"rate={revo2_data_rate_hz:.1f}Hz metadata={revo2_output.metadata}"
+                )
 
         prev_ax_pressed = False
         prev_by_pressed = False
         prev_start_combo = False
         prev_left_axis_click = False
         prev_right_axis_click = False
+        control_armed = control_arm_path is None
+        control_release_required = False
         while True:
             if revo2_output is not None:
                 revo2_output.check_health()
@@ -2190,59 +2329,116 @@ def run_pico_manager(
                 _,
             ) = get_controller_inputs(reader, keyboard=keyboard)
 
-            # Revo2 always follows the physical PICO Triggers and Grips, even
-            # when keyboard input supplies the manager's mode controls.
-            (
-                _,
-                left_trigger,
-                right_trigger,
-                left_grip_revo2,
-                right_grip_revo2,
-            ) = get_controller_inputs(reader, keyboard=None)
+            # Revo2 always follows fresh physical PICO Triggers and Grips.
+            # Keyboard mode only replaces manager controls.
+            revo2_trigger_sample = get_revo2_trigger_sample(reader)
+            left_axis_click, right_axis_click = get_axis_clicks(
+                reader, keyboard=keyboard
+            )
 
-            left_axis_click, right_axis_click = get_axis_clicks(reader, keyboard=keyboard)
+            arm_file_present = control_arm_path is None or control_arm_path.is_file()
+            if arm_file_present and not control_armed:
+                control_armed = True
+                control_release_required = True
+                print(
+                    "[Manager] Control input armed; release all controller "
+                    "buttons, grips, and triggers"
+                )
+            elif not arm_file_present and control_armed:
+                control_armed = False
+                control_release_required = False
+                print("[Manager] Control input locked; arm file is absent")
+
+            raw_control_active = any(
+                (
+                    a_pressed,
+                    b_pressed,
+                    x_pressed,
+                    y_pressed,
+                    left_menu_button,
+                    left_grip_mgr > 0.5,
+                    left_axis_click,
+                    right_axis_click,
+                )
+            )
+            if revo2_trigger_sample is not None:
+                raw_control_active = raw_control_active or any(
+                    value > 0.05
+                    for value in (
+                        revo2_trigger_sample[0],
+                        revo2_trigger_sample[1],
+                        revo2_trigger_sample[4],
+                        revo2_trigger_sample[5],
+                    )
+                )
+
+            if not control_armed or control_release_required:
+                if control_armed and control_release_required and not raw_control_active:
+                    control_release_required = False
+                    print("[Manager] Control input ready")
+                a_pressed = b_pressed = x_pressed = y_pressed = False
+                left_menu_button = False
+                left_grip_mgr = 0.0
+                left_axis_click = right_axis_click = False
 
             if revo2_output is not None and revo2_grip_gestures is not None:
-                grip_values = {
-                    "left": left_grip_revo2,
-                    "right": right_grip_revo2,
-                }
-                trigger_values = {
-                    "left": left_trigger,
-                    "right": right_trigger,
-                }
-                for side in ("left", "right"):
-                    # Left Grip+A/B remains reserved for record/discard. Any face-button
-                    # chord consumes the Grip gesture to avoid an accidental lock toggle.
-                    consume = any((a_pressed, b_pressed, x_pressed, y_pressed))
-                    if not revo2_grip_gestures[side].update(grip_values[side], consume=consume):
-                        continue
-                    if current_mode == StreamMode.OFF:
-                        continue
+                if revo2_trigger_sample is None:
+                    for gesture in revo2_grip_gestures.values():
+                        gesture.update(None, consume=True)
+                else:
+                    grip_values = {
+                        "left": revo2_trigger_sample[4],
+                        "right": revo2_trigger_sample[5],
+                    }
+                    trigger_values = {
+                        "left": revo2_trigger_sample[0],
+                        "right": revo2_trigger_sample[1],
+                    }
+                    consume = current_mode == StreamMode.OFF or any(
+                        (a_pressed, b_pressed, x_pressed, y_pressed)
+                    )
+                    for side in ("left", "right"):
+                        if not revo2_grip_gestures[side].update(
+                            grip_values[side], consume=consume
+                        ):
+                            continue
+                        if current_mode == StreamMode.OFF:
+                            continue
 
-                    left_locked, right_locked = revo2_output.hand_locks
-                    currently_locked = left_locked if side == "left" else right_locked
-                    if currently_locked:
-                        side_released = revo2_triggers_released(
+                        left_locked, right_locked = revo2_output.hand_locks
+                        currently_locked = (
+                            left_locked if side == "left" else right_locked
+                        )
+                        if currently_locked and not revo2_triggers_released(
                             trigger_values[side] if side == "left" else 0.0,
                             trigger_values[side] if side == "right" else 0.0,
-                        )
-                        if not side_released:
+                        ):
                             print(
                                 f"[Revo2Trigger] {side} unlock ignored: "
                                 f"release {side} Trigger first"
                             )
                             continue
 
-                    revo2_output.set_hand_locked(side, not currently_locked)
-                    state = "locked" if not currently_locked else "unlocked"
-                    print(f"[Revo2Trigger] {side} hand {state}")
+                        revo2_output.set_hand_locked(side, not currently_locked)
+                        state = "locked" if not currently_locked else "unlocked"
+                        print(f"[Revo2Trigger] {side} hand {state}")
 
-            if revo2_output is not None and right_axis_click and not prev_right_axis_click:
+            if (
+                revo2_output is not None
+                and right_axis_click
+                and not prev_right_axis_click
+            ):
                 if revo2_output.any_hand_locked:
                     print("[Revo2Trigger] mode switch ignored: unlock both hands first")
-                elif not revo2_triggers_released(left_trigger, right_trigger):
-                    print("[Revo2Trigger] mode switch ignored: release both Triggers first")
+                elif revo2_trigger_sample is None:
+                    print("[Revo2Trigger] mode switch ignored: no fresh Trigger sample")
+                elif not revo2_triggers_released(
+                    revo2_trigger_sample[0], revo2_trigger_sample[1]
+                ):
+                    print(
+                        "[Revo2Trigger] mode switch ignored: "
+                        "release both Triggers first"
+                    )
                 else:
                     active_mode = revo2_output.cycle_mode()
                     print(
@@ -2369,9 +2565,12 @@ def run_pico_manager(
                     exit()
 
                 if revo2_output is not None:
-                    if not submit_revo2_target(left_trigger, right_trigger):
-                        raise RuntimeError("cannot enable Revo2 without fresh XR input")
-                    revo2_output.set_enabled(True)
+                    if new_mode == StreamMode.POSE_PAUSE:
+                        revo2_output.set_enabled(False)
+                    else:
+                        if not submit_revo2_target(revo2_trigger_sample):
+                            raise RuntimeError("cannot enable Revo2 without fresh XR input")
+                        revo2_output.set_enabled(True)
 
                 if (
                     new_mode == StreamMode.PLANNER
@@ -2385,8 +2584,26 @@ def run_pico_manager(
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
 
-            if revo2_output is not None and current_mode != StreamMode.OFF:
-                submit_revo2_target(left_trigger, right_trigger)
+            if revo2_output is not None and current_mode not in {
+                StreamMode.OFF,
+                StreamMode.POSE_PAUSE,
+            }:
+                submit_revo2_target(revo2_trigger_sample)
+
+            if revo2_output is not None and revo2_capture_data:
+                revo2_state = revo2_output.get_latest_state()
+                if (
+                    revo2_state is not None
+                    and int(revo2_state["publish_ns"]) > revo2_last_published_ns
+                ):
+                    socket.send(
+                        pack_pose_message(
+                            revo2_state_to_wire(revo2_state), topic="revo2_state"
+                        )
+                    )
+                    revo2_last_published_ns = int(revo2_state["publish_ns"])
+
+            publish_revo2_raw_events()
 
             # Mode-independent: send manager_state for data exporter
             toggle_dc_tmp = bool(a_pressed) and left_grip_mgr > 0.5
@@ -2395,6 +2612,10 @@ def run_pico_manager(
             toggle_da = toggle_da_tmp and not prev_toggle_da
             prev_toggle_dc = toggle_dc_tmp
             prev_toggle_da = toggle_da_tmp
+            if toggle_dc:
+                print("[Manager] Episode toggle requested: right A + left Grip")
+            if toggle_da:
+                print("[Manager] Episode discard requested: right B + left Grip")
             socket.send(
                 pack_pose_message(
                     {
@@ -2456,7 +2677,7 @@ def run_pico_manager(
                     cleanup.callback(keyboard.stop)
                 cleanup.callback(reader.stop)
                 if revo2_output is not None:
-                    cleanup.callback(revo2_output.close)
+                    cleanup.callback(close_revo2_owner)
         finally:
             print("[Manager] Shutdown complete")
 
@@ -2566,6 +2787,14 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--control-arm-file",
+        type=str,
+        help=(
+            "Ignore policy, episode, and mode controls until this file exists; "
+            "all controls must then be released before the first command"
+        ),
+    )
+    parser.add_argument(
         "--keyboard-ttl-sec",
         type=float,
         default=0.32,
@@ -2609,7 +2838,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--revo2-trigger",
         action="store_true",
-        help="Map each PICO Trigger through a selectable six-channel Revo2 profile",
+        help="Map PICO Triggers through a selectable six-channel Revo2 profile",
     )
     parser.add_argument(
         "--revo2-devices",
@@ -2622,17 +2851,47 @@ if __name__ == "__main__":
         help="Optional JSON file containing named Trigger-to-Revo2 mode profiles",
     )
     parser.add_argument("--revo2-deadman-s", type=float, default=0.3)
-    parser.add_argument("--revo2-slew-per-s", type=float, default=0.4)
+    parser.add_argument("--revo2-slew-per-s", type=float, default=0.2)
     parser.add_argument("--revo2-command-period-s", type=float, default=0.04)
     parser.add_argument("--revo2-thumb-delta", type=float, default=0.15)
     parser.add_argument("--revo2-finger-delta", type=float, default=0.20)
     parser.add_argument("--revo2-command-speed", type=float, default=0.25)
+    parser.add_argument(
+        "--revo2-capture-data",
+        action="store_true",
+        help="Publish measured Revo2 motor/tactile state on the revo2_state topic",
+    )
+    parser.add_argument(
+        "--revo2-capture-raw-data",
+        action="store_true",
+        help="Relay every available native Revo2 buffer sample on revo2_raw",
+    )
+    parser.add_argument(
+        "--revo2-data-rate-hz",
+        type=float,
+        default=20.0,
+        help="BrainCo motor/tactile collection frequency per hand (default: 20 Hz)",
+    )
+    parser.add_argument(
+        "--revo2-touch-setup",
+        action="store_true",
+        help="Explicitly enable all detected touch channels before collection",
+    )
     args = parser.parse_args()
 
     if args.revo2_trigger and not args.manager:
         parser.error("--revo2-trigger requires --manager")
     if args.revo2_trigger and not args.revo2_devices:
         parser.error("--revo2-trigger requires --revo2-devices")
+    if args.revo2_capture_data and not args.revo2_trigger:
+        parser.error("--revo2-capture-data requires --revo2-trigger")
+    if args.revo2_capture_raw_data and not args.revo2_trigger:
+        parser.error("--revo2-capture-raw-data requires --revo2-trigger")
+    if args.revo2_touch_setup and not (args.revo2_capture_data or args.revo2_capture_raw_data):
+        parser.error(
+            "--revo2-touch-setup requires --revo2-capture-data or "
+            "--revo2-capture-raw-data"
+        )
 
     # Standalone VR3Pt test modes (exit after finishing)
     if args.vr3pt_test:
@@ -2658,46 +2917,59 @@ if __name__ == "__main__":
     with_g1_robot = not args.no_g1
 
     if args.manager:
-        run_pico_manager(
-            port=args.port,
-            buffer_size=args.buffer_size,
-            num_frames_to_send=args.num_frames_to_send,
-            target_fps=args.target_fps,
-            use_cuda=args.cuda,
-            record_dir=args.record_dir,
-            record_format=args.record_format,
-            zmq_feedback_host=args.zmq_feedback_host,
-            zmq_feedback_port=args.zmq_feedback_port,
-            enable_vis_vr3pt=args.vis_vr3pt,
-            with_g1_robot=with_g1_robot,
-            enable_waist_tracking=args.waist_tracking,
-            enable_smpl_vis=args.vis_smpl,
-            input_source=args.input_source,
-            control_source=args.control_source,
-            keyboard_ttl_sec=args.keyboard_ttl_sec,
-            keyboard_a=args.keyboard_a,
-            keyboard_b=args.keyboard_b,
-            keyboard_x=args.keyboard_x,
-            keyboard_y=args.keyboard_y,
-            keyboard_grip=args.keyboard_grip,
-            keyboard_start_stop=args.keyboard_start_stop,
-            keyboard_mode=args.keyboard_mode,
-            keyboard_frozen_mode=args.keyboard_frozen_mode,
-            keyboard_record=args.keyboard_record,
-            keyboard_discard=args.keyboard_discard,
-            keyboard_menu=args.keyboard_menu,
-            keyboard_axis_click=args.keyboard_axis_click,
-            keyboard_revo2_mode=args.keyboard_revo2_mode,
-            revo2_trigger=args.revo2_trigger,
-            revo2_devices=args.revo2_devices,
-            revo2_modes=args.revo2_modes,
-            revo2_deadman_s=args.revo2_deadman_s,
-            revo2_slew_per_s=args.revo2_slew_per_s,
-            revo2_command_period_s=args.revo2_command_period_s,
-            revo2_thumb_delta=args.revo2_thumb_delta,
-            revo2_finger_delta=args.revo2_finger_delta,
-            revo2_command_speed=args.revo2_command_speed,
-        )
+        try:
+            run_pico_manager(
+                port=args.port,
+                buffer_size=args.buffer_size,
+                num_frames_to_send=args.num_frames_to_send,
+                target_fps=args.target_fps,
+                use_cuda=args.cuda,
+                record_dir=args.record_dir,
+                record_format=args.record_format,
+                zmq_feedback_host=args.zmq_feedback_host,
+                zmq_feedback_port=args.zmq_feedback_port,
+                enable_vis_vr3pt=args.vis_vr3pt,
+                with_g1_robot=with_g1_robot,
+                enable_waist_tracking=args.waist_tracking,
+                enable_smpl_vis=args.vis_smpl,
+                input_source=args.input_source,
+                control_source=args.control_source,
+                control_arm_file=args.control_arm_file,
+                keyboard_ttl_sec=args.keyboard_ttl_sec,
+                keyboard_a=args.keyboard_a,
+                keyboard_b=args.keyboard_b,
+                keyboard_x=args.keyboard_x,
+                keyboard_y=args.keyboard_y,
+                keyboard_grip=args.keyboard_grip,
+                keyboard_start_stop=args.keyboard_start_stop,
+                keyboard_mode=args.keyboard_mode,
+                keyboard_frozen_mode=args.keyboard_frozen_mode,
+                keyboard_record=args.keyboard_record,
+                keyboard_discard=args.keyboard_discard,
+                keyboard_menu=args.keyboard_menu,
+                keyboard_axis_click=args.keyboard_axis_click,
+                keyboard_revo2_mode=args.keyboard_revo2_mode,
+                revo2_trigger=args.revo2_trigger,
+                revo2_devices=args.revo2_devices,
+                revo2_modes=args.revo2_modes,
+                revo2_deadman_s=args.revo2_deadman_s,
+                revo2_slew_per_s=args.revo2_slew_per_s,
+                revo2_command_period_s=args.revo2_command_period_s,
+                revo2_thumb_delta=args.revo2_thumb_delta,
+                revo2_finger_delta=args.revo2_finger_delta,
+                revo2_command_speed=args.revo2_command_speed,
+                revo2_capture_data=args.revo2_capture_data,
+                revo2_capture_raw_data=args.revo2_capture_raw_data,
+                revo2_data_rate_hz=args.revo2_data_rate_hz,
+                revo2_touch_setup=args.revo2_touch_setup,
+            )
+        except KeyboardInterrupt:
+            print("\nStopping manager before input readiness...")
+            if args.input_source == "xrt":
+                try:
+                    _close_xrt_sdk(args.input_source)
+                except Exception as exc:
+                    print(f"[Manager] XRoboToolkit shutdown warning: {exc}")
     else:
         # Run legacy single-thread pose streaming
         run_pico(

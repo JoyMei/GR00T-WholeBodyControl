@@ -14,16 +14,28 @@ echo "🔧 Setting up G1 Deploy environment..."
 : "${CUDAToolkit_ROOT:=}"
 : "${BASH_VERSION:=}"
 : "${PS1:=}"
+: "${SKIP_JETSON_CLOCKS:=0}"
+: "${SETUP_ENV_NONINTERACTIVE_SUDO:=0}"
+
+run_setup_sudo() {
+    if [ "$SETUP_ENV_NONINTERACTIVE_SUDO" = "1" ]; then
+        sudo -n "$@"
+    else
+        sudo "$@"
+    fi
+}
 
 # Run jetson_clocks on Jetson systems (bare-metal only)
-if command -v jetson_clocks &> /dev/null; then
+if [ "$SKIP_JETSON_CLOCKS" = "1" ]; then
+    echo "ℹ️  jetson_clocks already handled by the caller"
+elif command -v jetson_clocks &> /dev/null; then
     if [ -f "/.dockerenv" ]; then
         # Inside Docker - skip (jetson_clocks needs host access)
         echo "ℹ️  Inside Docker - jetson_clocks should be run on host"
     else
         # Bare-metal Jetson - set max performance
         echo "🚀 Setting Jetson to max performance..."
-        sudo jetson_clocks 2>/dev/null || echo "⚠️  jetson_clocks failed (needs sudo)"
+        run_setup_sudo jetson_clocks 2>/dev/null || echo "⚠️  jetson_clocks failed (needs sudo)"
     fi
 fi
 
@@ -194,8 +206,8 @@ if [ -n "$TensorRT_ROOT" ]; then
         # Create missing libcudla.so.1 symlink if needed (TensorRT expects this name)
         if [ -f "/usr/lib/aarch64-linux-gnu/nvidia/libnvcudla.so" ] && [ ! -f "/usr/lib/aarch64-linux-gnu/nvidia/libcudla.so.1" ]; then
             echo "   🔗 Creating libcudla.so.1 symlink for TensorRT compatibility..."
-            sudo ln -sf libnvcudla.so /usr/lib/aarch64-linux-gnu/nvidia/libcudla.so.1 2>/dev/null || echo "   ⚠️  Could not create symlink (may need sudo)"
-            sudo ln -sf libnvcudla.so /usr/lib/aarch64-linux-gnu/nvidia/libcudla.so 2>/dev/null || echo "   ⚠️  Could not create symlink (may need sudo)"
+            run_setup_sudo ln -sf libnvcudla.so /usr/lib/aarch64-linux-gnu/nvidia/libcudla.so.1 2>/dev/null || echo "   ⚠️  Could not create symlink (may need sudo)"
+            run_setup_sudo ln -sf libnvcudla.so /usr/lib/aarch64-linux-gnu/nvidia/libcudla.so 2>/dev/null || echo "   ⚠️  Could not create symlink (may need sudo)"
             echo "   ✅ libcudla.so.1 → libnvcudla.so"
         fi
         

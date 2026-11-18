@@ -8,21 +8,9 @@ import socket
 import subprocess
 import time
 
-from gear_sonic.utils.teleop.revo2_trigger import Revo2Device, Revo2TriggerOutput
-
-DEVICES = (
-    Revo2Device(
-        side="left",
-        port="/dev/ttyUSB0",
-        serial="BCXTL2206J260000B",
-        slave_id=126,
-    ),
-    Revo2Device(
-        side="right",
-        port="/dev/ttyUSB1",
-        serial="BCXTR2212J2600027",
-        slave_id=127,
-    ),
+from gear_sonic.utils.teleop.revo2_trigger import (
+    Revo2TriggerOutput,
+    load_revo2_devices,
 )
 
 
@@ -30,9 +18,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duration-s", type=float, default=30.0)
     parser.add_argument("--hz", type=float, default=20.0)
+    parser.add_argument("--devices", required=True)
     parser.add_argument("--thumb-delta", type=float, default=0.15)
     parser.add_argument("--finger-delta", type=float, default=0.20)
     parser.add_argument("--speed", type=float, default=0.25)
+    parser.add_argument("--slew-per-s", type=float, default=0.2)
     parser.add_argument("--deadman-s", type=float, default=0.3)
     parser.add_argument("--xrt-ready-timeout-s", type=float, default=30.0)
     parser.add_argument("--confirm-move", action="store_true")
@@ -53,6 +43,8 @@ def main() -> None:
         raise SystemExit("duration/hz outside commissioning limits")
     if not 1.0 <= args.xrt_ready_timeout_s <= 60.0:
         raise SystemExit("XR readiness timeout outside commissioning limits")
+    if not 0.01 <= args.slew_per_s <= min(0.5, args.speed):
+        raise SystemExit("slew-per-s must be within [0.01, min(0.5, speed)]")
 
     import xrobotoolkit_sdk as xrt
 
@@ -91,9 +83,9 @@ def main() -> None:
             raise RuntimeError("XR did not become live with both Triggers released")
 
         output = Revo2TriggerOutput(
-            DEVICES,
+            load_revo2_devices(args.devices),
             deadman_s=args.deadman_s,
-            slew_per_s=0.4,
+            slew_per_s=args.slew_per_s,
             command_period_s=0.04,
             thumb_delta=args.thumb_delta,
             finger_delta=args.finger_delta,

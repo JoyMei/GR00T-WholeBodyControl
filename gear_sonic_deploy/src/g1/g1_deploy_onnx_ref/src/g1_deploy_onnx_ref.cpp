@@ -67,6 +67,7 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <thread>
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -77,6 +78,7 @@
 #include <unitree/idl/hg/LowCmd_.hpp>
 #include <unitree/idl/hg/LowState_.hpp>
 #include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp>
+#include <unitree/robot/g1/loco/g1_loco_client.hpp>
 
 // TRTInference
 #include <TRTInference/InferenceEngine.h>
@@ -280,6 +282,7 @@ class G1Deploy {
     // External clients and peripheral managers
     // =========================================================================
     std::unique_ptr<unitree::robot::b2::MotionSwitcherClient> msc_;
+    std::unique_ptr<unitree::robot::g1::LocoClient> loco_client_;
     
     // Dex3 hands manager
     Dex3Hands dex3_hands_;
@@ -2217,6 +2220,10 @@ class G1Deploy {
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
 
+      loco_client_ = std::make_unique<unitree::robot::g1::LocoClient>();
+      loco_client_->SetTimeout(5.0f);
+      loco_client_->Init();
+
       // Initialize Dex3 hands (ChannelFactory already initialized above)
       dex3_hands_.initialize("");
 
@@ -2743,8 +2750,9 @@ class G1Deploy {
       dex3_hands_.writeOnce();
     }
 
-    /// Gracefully stop all threads and send a damping-only command.
-    void Stop() {
+    /// Stop all SONIC writers, then restore active balance for a normal handoff.
+    bool Stop() {
+      const bool return_to_remote = operator_state.return_to_remote;
       operator_state.stop = true;
 
       if (control_thread_ptr_) {
@@ -2760,11 +2768,100 @@ class G1Deploy {
         }
       }
       CreateDampingCommand();
+      if (return_to_remote) {
+        return RestoreRemoteWalkRun();
+      }
       LowCommandWriter();
-      std::cout << "Stop" << std::endl;
+      std::cerr << "[stop][emergency] SONIC low-level writer stopped; no automatic AI/Walk-Run restore. "
+                   "Keep the gantry attached and use the physical E-stop if needed."
+                << std::endl;
+      return true;
     }
 
-    /// Write a zero-torque, damping-only motor command (safe shutdown pose).
+    bool RestoreRemoteWalkRun() {
+      using Clock = std::chrono::steady_clock;
+      constexpr auto kDampingWindow = std::chrono::milliseconds(500);
+      constexpr auto kCommandPeriod = std::chrono::milliseconds(2);
+      auto next_write = Clock::now();
+      const auto damping_deadline = next_write + kDampingWindow;
+      while (Clock::now() < damping_deadline) {
+        LowCommandWriter();
+        next_write += kCommandPeriod;
+        std::this_thread::sleep_until(next_write);
+      }
+
+      std::cout << "[handoff] SONIC lowcmd writer stopped; requesting Unitree ai mode."
+                << std::endl;
+      const int32_t select_ret = msc_->SelectMode("ai");
+      std::string form;
+      std::string mode;
+      int32_t mode_ret = -1;
+      const auto mode_deadline = Clock::now() + std::chrono::seconds(5);
+      while (Clock::now() < mode_deadline) {
+        form.clear();
+        mode.clear();
+        mode_ret = msc_->CheckMode(form, mode);
+        if (mode_ret == 0 && mode == "ai") {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      }
+      if (mode_ret != 0 || mode != "ai") {
+        std::cerr << "[handoff][blocked] Unitree ai mode readback failed: select_status="
+                  << select_ret << " check_status=" << mode_ret << " mode='" << mode
+                  << "'. Keep the gantry attached; do not detach or move the robot."
+                  << std::endl;
+        return false;
+      }
+      if (select_ret != 0) {
+        std::cout << "[handoff] SelectMode returned " << select_ret
+                  << ", but CheckMode confirms ai; continuing by readback."
+                  << std::endl;
+      }
+
+      int fsm_id = -1;
+      const int32_t fsm_before_ret = loco_client_->GetFsmId(fsm_id);
+      if (fsm_before_ret != 0) {
+        std::cerr << "[handoff][blocked] GetFsmId pre-read failed: status="
+                  << fsm_before_ret << ". Keep the gantry attached; do not detach."
+                  << std::endl;
+        return false;
+      }
+
+      int32_t start_ret = -1;
+      int32_t fsm_ret = -1;
+      constexpr auto kReadyTimeout = std::chrono::seconds(7);
+      constexpr auto kStartRetry = std::chrono::milliseconds(1500);
+      const auto ready_deadline = Clock::now() + kReadyTimeout;
+      auto next_start = Clock::now();
+      while (Clock::now() < ready_deadline) {
+        if (Clock::now() >= next_start) {
+          start_ret = loco_client_->Start();
+          next_start = Clock::now() + kStartRetry;
+        }
+        fsm_ret = loco_client_->GetFsmId(fsm_id);
+        if (fsm_ret == 0 && IsRemoteWalkRunFsm(fsm_id)) {
+          std::cout << "[handoff][ready] mode=ai fsm=" << fsm_id
+                    << "; Unitree active balance owns G1; remote control may proceed."
+                    << std::endl;
+          return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+
+      std::cerr << "[handoff][blocked] active-balance readback failed: Start_status="
+                << start_ret << " GetFsmId_status=" << fsm_ret << " fsm=" << fsm_id
+                << ". Keep the gantry attached; do not detach or move the robot."
+                << std::endl;
+      return false;
+    }
+
+    static bool IsRemoteWalkRunFsm(int fsm_id) {
+      return fsm_id == 500 || fsm_id == 801 || fsm_id == 802;
+    }
+
+    /// Write a transient zero-torque damping command for owner handoff.
+    /// This is not a standing or fall-prevention mode by itself.
     void CreateDampingCommand() {
       MotorCommand motor_command_tmp;
       const std::shared_ptr<const LowState_> ls = low_state_buffer_.GetDataWithTime().data;
@@ -4555,9 +4652,12 @@ int main(int argc, char const* argv[]) {
 #endif
   
   std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;
-  custom.Stop();
+  const bool stop_ok = custom.Stop();
   std::cout << "[DEBUG] Waiting for cleanup..." << std::endl;
   sleep(0.5);
+  if (custom.operator_state.return_to_remote && !stop_ok) {
+    return 3;
+  }
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }

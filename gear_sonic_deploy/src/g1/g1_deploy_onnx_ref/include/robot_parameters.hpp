@@ -64,7 +64,8 @@ struct HeadingState {
  * @brief High-level operator signals (set by input interfaces, read by control loop).
  */
 struct OperatorState {
-  bool stop = false;   ///< Emergency stop requested.
+  bool stop = false;   ///< Stop requested.
+  bool return_to_remote = false;  ///< Normal low-level to Unitree AI/Walk-Run handoff.
   bool start = false;  ///< Control-system start requested.
   bool play = false;   ///< Motion playback active.
 };

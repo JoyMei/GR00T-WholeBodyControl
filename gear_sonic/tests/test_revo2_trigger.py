@@ -166,6 +166,14 @@ def test_grip_gesture_toggles_on_release_and_consumes_chords():
     assert not gesture.update(0.0)
 
 
+def test_grip_gesture_tracking_gap_consumes_pending_toggle():
+    gesture = Revo2GripGesture()
+
+    assert not gesture.update(0.8)
+    assert not gesture.update(None, consume=True)
+    assert not gesture.update(0.0)
+
+
 def test_locked_target_freezes_only_selected_hand():
     previous = np.array([[0.2] * 6, [0.3] * 6])
     target = np.array([[0.8] * 6, [0.9] * 6])
