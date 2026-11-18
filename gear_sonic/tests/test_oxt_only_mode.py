@@ -1,3 +1,4 @@
+import signal
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,6 +8,7 @@ from gear_sonic.scripts import run_data_exporter as exporter_script
 from gear_sonic.scripts.run_data_exporter import (
     GrootDataCollector,
     SonicDataExporterConfig,
+    install_shutdown_signal_handlers,
     validate_capture_mode_config,
 )
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
@@ -51,6 +53,16 @@ def make_oxt_only_collector(*keys):
 
 
 class OxtOnlyModeTest(unittest.TestCase):
+    def test_shutdown_signals_raise_keyboard_interrupt_for_normal_cleanup(self):
+        with mock.patch.object(exporter_script.signal, "signal") as register:
+            install_shutdown_signal_handlers()
+
+        handlers = {call.args[0]: call.args[1] for call in register.call_args_list}
+        self.assertEqual(set(handlers), {signal.SIGINT, signal.SIGTERM})
+        for handler in handlers.values():
+            with self.assertRaises(KeyboardInterrupt):
+                handler(signal.SIGTERM, None)
+
     def test_native_lerobot_default_config_remains_valid(self):
         validate_capture_mode_config(SonicDataExporterConfig())
 

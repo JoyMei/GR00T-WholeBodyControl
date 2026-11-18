@@ -30,6 +30,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import ExitStack
 from enum import Enum, IntEnum
+from pathlib import Path
 
 import msgpack
 import numpy as np
@@ -897,7 +898,7 @@ class PicoReader:
 
     def stop(self):
         self._stop.set()
-        self._thread.join(timeout=1.0)
+        self._thread.join()
 
     def get_latest(self):
         with self._lock:
@@ -2010,6 +2011,7 @@ def run_pico_manager(
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
     control_source: str = "controller",
+    control_arm_file: str | None = None,
     keyboard_ttl_sec: float = 0.32,
     keyboard_a: str = "a",
     keyboard_b: str = "b",
@@ -2054,6 +2056,11 @@ def run_pico_manager(
         raise ValueError("revo2_capture_raw_data requires Revo2 Trigger output")
     if revo2_touch_setup and not (revo2_capture_data or revo2_capture_raw_data):
         raise ValueError("revo2_touch_setup requires Revo2 data capture")
+    control_arm_path = (
+        Path(control_arm_file).expanduser().resolve() if control_arm_file else None
+    )
+    if control_arm_path is not None:
+        print(f"[Manager] Control input locked; waiting for arm file: {control_arm_path}")
     reader = _init_input_source(input_source, buffer_size)
     keyboard = None
     if control_source == "keyboard":
@@ -2303,6 +2310,8 @@ def run_pico_manager(
         prev_start_combo = False
         prev_left_axis_click = False
         prev_right_axis_click = False
+        control_armed = control_arm_path is None
+        control_release_required = False
         while True:
             if revo2_output is not None:
                 revo2_output.check_health()
@@ -2323,6 +2332,54 @@ def run_pico_manager(
             # Revo2 always follows the physical PICO Triggers.  In keyboard
             # mode the keyboard adapter intentionally reports zero triggers.
             revo2_trigger_sample = get_revo2_trigger_sample(reader)
+            left_axis_click, right_axis_click = get_axis_clicks(
+                reader, keyboard=keyboard
+            )
+
+            arm_file_present = control_arm_path is None or control_arm_path.is_file()
+            if arm_file_present and not control_armed:
+                control_armed = True
+                control_release_required = True
+                print(
+                    "[Manager] Control input armed; release all controller "
+                    "buttons, grips, and triggers"
+                )
+            elif not arm_file_present and control_armed:
+                control_armed = False
+                control_release_required = False
+                print("[Manager] Control input locked; arm file is absent")
+
+            raw_control_active = any(
+                (
+                    a_pressed,
+                    b_pressed,
+                    x_pressed,
+                    y_pressed,
+                    left_menu_button,
+                    left_grip_mgr > 0.5,
+                    left_axis_click,
+                    right_axis_click,
+                )
+            )
+            if revo2_trigger_sample is not None:
+                raw_control_active = raw_control_active or any(
+                    value > 0.05
+                    for value in (
+                        revo2_trigger_sample[0],
+                        revo2_trigger_sample[1],
+                        revo2_trigger_sample[4],
+                        revo2_trigger_sample[5],
+                    )
+                )
+
+            if not control_armed or control_release_required:
+                if control_armed and control_release_required and not raw_control_active:
+                    control_release_required = False
+                    print("[Manager] Control input ready")
+                a_pressed = b_pressed = x_pressed = y_pressed = False
+                left_menu_button = False
+                left_grip_mgr = 0.0
+                left_axis_click = right_axis_click = False
 
             if revo2_output is not None and revo2_grip_gestures is not None:
                 if revo2_trigger_sample is None:
@@ -2365,10 +2422,6 @@ def run_pico_manager(
                         revo2_output.set_hand_locked(side, not currently_locked)
                         state = "locked" if not currently_locked else "unlocked"
                         print(f"[Revo2Trigger] {side} hand {state}")
-
-            left_axis_click, right_axis_click = get_axis_clicks(
-                reader, keyboard=keyboard
-            )
 
             if (
                 revo2_output is not None
@@ -2560,6 +2613,10 @@ def run_pico_manager(
             toggle_da = toggle_da_tmp and not prev_toggle_da
             prev_toggle_dc = toggle_dc_tmp
             prev_toggle_da = toggle_da_tmp
+            if toggle_dc:
+                print("[Manager] Episode toggle requested: right A + left Grip")
+            if toggle_da:
+                print("[Manager] Episode discard requested: right B + left Grip")
             socket.send(
                 pack_pose_message(
                     {
@@ -2723,6 +2780,14 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--control-arm-file",
+        type=str,
+        help=(
+            "Ignore policy, episode, and mode controls until this file exists; "
+            "all controls must then be released before the first command"
+        ),
+    )
+    parser.add_argument(
         "--keyboard-ttl-sec",
         type=float,
         default=0.32,
@@ -2845,50 +2910,59 @@ if __name__ == "__main__":
     with_g1_robot = not args.no_g1
 
     if args.manager:
-        run_pico_manager(
-            port=args.port,
-            buffer_size=args.buffer_size,
-            num_frames_to_send=args.num_frames_to_send,
-            target_fps=args.target_fps,
-            use_cuda=args.cuda,
-            record_dir=args.record_dir,
-            record_format=args.record_format,
-            zmq_feedback_host=args.zmq_feedback_host,
-            zmq_feedback_port=args.zmq_feedback_port,
-            enable_vis_vr3pt=args.vis_vr3pt,
-            with_g1_robot=with_g1_robot,
-            enable_waist_tracking=args.waist_tracking,
-            enable_smpl_vis=args.vis_smpl,
-            input_source=args.input_source,
-            control_source=args.control_source,
-            keyboard_ttl_sec=args.keyboard_ttl_sec,
-            keyboard_a=args.keyboard_a,
-            keyboard_b=args.keyboard_b,
-            keyboard_x=args.keyboard_x,
-            keyboard_y=args.keyboard_y,
-            keyboard_grip=args.keyboard_grip,
-            keyboard_start_stop=args.keyboard_start_stop,
-            keyboard_mode=args.keyboard_mode,
-            keyboard_frozen_mode=args.keyboard_frozen_mode,
-            keyboard_record=args.keyboard_record,
-            keyboard_discard=args.keyboard_discard,
-            keyboard_menu=args.keyboard_menu,
-            keyboard_axis_click=args.keyboard_axis_click,
-            keyboard_revo2_mode=args.keyboard_revo2_mode,
-            revo2_trigger=args.revo2_trigger,
-            revo2_devices=args.revo2_devices,
-            revo2_modes=args.revo2_modes,
-            revo2_deadman_s=args.revo2_deadman_s,
-            revo2_slew_per_s=args.revo2_slew_per_s,
-            revo2_command_period_s=args.revo2_command_period_s,
-            revo2_thumb_delta=args.revo2_thumb_delta,
-            revo2_finger_delta=args.revo2_finger_delta,
-            revo2_command_speed=args.revo2_command_speed,
-            revo2_capture_data=args.revo2_capture_data,
-            revo2_capture_raw_data=args.revo2_capture_raw_data,
-            revo2_data_rate_hz=args.revo2_data_rate_hz,
-            revo2_touch_setup=args.revo2_touch_setup,
-        )
+        try:
+            run_pico_manager(
+                port=args.port,
+                buffer_size=args.buffer_size,
+                num_frames_to_send=args.num_frames_to_send,
+                target_fps=args.target_fps,
+                use_cuda=args.cuda,
+                record_dir=args.record_dir,
+                record_format=args.record_format,
+                zmq_feedback_host=args.zmq_feedback_host,
+                zmq_feedback_port=args.zmq_feedback_port,
+                enable_vis_vr3pt=args.vis_vr3pt,
+                with_g1_robot=with_g1_robot,
+                enable_waist_tracking=args.waist_tracking,
+                enable_smpl_vis=args.vis_smpl,
+                input_source=args.input_source,
+                control_source=args.control_source,
+                control_arm_file=args.control_arm_file,
+                keyboard_ttl_sec=args.keyboard_ttl_sec,
+                keyboard_a=args.keyboard_a,
+                keyboard_b=args.keyboard_b,
+                keyboard_x=args.keyboard_x,
+                keyboard_y=args.keyboard_y,
+                keyboard_grip=args.keyboard_grip,
+                keyboard_start_stop=args.keyboard_start_stop,
+                keyboard_mode=args.keyboard_mode,
+                keyboard_frozen_mode=args.keyboard_frozen_mode,
+                keyboard_record=args.keyboard_record,
+                keyboard_discard=args.keyboard_discard,
+                keyboard_menu=args.keyboard_menu,
+                keyboard_axis_click=args.keyboard_axis_click,
+                keyboard_revo2_mode=args.keyboard_revo2_mode,
+                revo2_trigger=args.revo2_trigger,
+                revo2_devices=args.revo2_devices,
+                revo2_modes=args.revo2_modes,
+                revo2_deadman_s=args.revo2_deadman_s,
+                revo2_slew_per_s=args.revo2_slew_per_s,
+                revo2_command_period_s=args.revo2_command_period_s,
+                revo2_thumb_delta=args.revo2_thumb_delta,
+                revo2_finger_delta=args.revo2_finger_delta,
+                revo2_command_speed=args.revo2_command_speed,
+                revo2_capture_data=args.revo2_capture_data,
+                revo2_capture_raw_data=args.revo2_capture_raw_data,
+                revo2_data_rate_hz=args.revo2_data_rate_hz,
+                revo2_touch_setup=args.revo2_touch_setup,
+            )
+        except KeyboardInterrupt:
+            print("\nStopping manager before input readiness...")
+            if args.input_source == "xrt":
+                try:
+                    _close_xrt_sdk(args.input_source)
+                except Exception as exc:
+                    print(f"[Manager] XRoboToolkit shutdown warning: {exc}")
     else:
         # Run legacy single-thread pose streaming
         run_pico(

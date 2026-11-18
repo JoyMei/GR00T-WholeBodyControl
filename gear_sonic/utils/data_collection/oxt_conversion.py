@@ -189,8 +189,18 @@ def _field_value(
         raise ValueError("value_path must be a JSON path list")
     source = item if is_item else value
     if not path:
-        return source
-    return _path_value(source, path, label="value")
+        selected = source
+    else:
+        selected = _path_value(source, path, label="value")
+    select_indices = field.get("select_indices")
+    if select_indices is not None:
+        if not isinstance(select_indices, list) or not select_indices:
+            raise ValueError("select_indices must be a non-empty list")
+        try:
+            selected = np.asarray(selected)[select_indices]
+        except (IndexError, TypeError, ValueError) as exc:
+            raise ValueError("select_indices cannot be applied to the source value") from exc
+    return selected
 
 
 def _array_value(value: Any, field: Mapping[str, Any]) -> np.ndarray:
@@ -211,6 +221,14 @@ def _array_value(value: Any, field: Mapping[str, Any]) -> np.ndarray:
         raise ValueError(f"cannot convert source value using dtype {field.get('dtype')!r}") from exc
     if result.dtype.kind == "O":
         raise ValueError("object arrays are not allowed in OXT Zarr output")
+    reshape = field.get("reshape")
+    if reshape is not None:
+        if not isinstance(reshape, list) or not reshape:
+            raise ValueError("reshape must be a non-empty list")
+        try:
+            result = result.reshape(tuple(int(dimension) for dimension in reshape))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"sample cannot be reshaped to {reshape!r}") from exc
     expected_shape = field.get("shape")
     if not isinstance(expected_shape, list):
         raise ValueError("sample fields require an explicit shape list")

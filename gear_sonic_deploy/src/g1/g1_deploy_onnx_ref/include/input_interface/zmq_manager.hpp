@@ -34,6 +34,7 @@
  *   Key  | Action
  *   -----|-------
  *   O/o  | Emergency stop
+ *   R/r  | Normal stop and return control to Unitree AI/Walk-Run
  *   g/G, h/H | Left-hand compliance ±0.1
  *   b/B, v/V | Right-hand compliance ±0.1
  *   x/X, c/C | Hand max-close ratio ±0.1
@@ -173,6 +174,13 @@ class ZMQManager : public InputInterface {
             emergency_stop_ = true;
             is_manager_key = true;
             std::cout << "[ZMQManager] EMERGENCY STOP (O/o)" << std::endl;
+            break;
+          case 'r':
+          case 'R':
+            stop_control_ = true;
+            is_manager_key = true;
+            std::cout << "[ZMQManager] Normal stop requested; returning to Unitree remote control (R/r)"
+                      << std::endl;
             break;
           case 'f':
           case 'F':
@@ -341,6 +349,7 @@ class ZMQManager : public InputInterface {
 
       // Handle stop control
       if (stop_control_) {
+        operator_state.return_to_remote = true;
         operator_state.stop = true;
         if (planner_state.enabled) {
           planner_state.enabled = false;

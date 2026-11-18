@@ -6,6 +6,8 @@ quaternion apply, inverse, slerp, and SMPL joint computation.
 
 # This file assumes w x y z quaternion format
 import os
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -595,7 +597,7 @@ human_joints_info = None
 def compute_human_joints(
     body_pose,
     global_orient,
-    human_joints_info_path="gear_sonic/data/human/human_joints_info.pkl",
+    human_joints_info_path=None,
     use_thumb_joints=True,
 ):
     """
@@ -614,6 +616,13 @@ def compute_human_joints(
     global human_joints_info
 
     if human_joints_info is None:
+        if human_joints_info_path is None:
+            human_joints_info_path = (
+                Path(__file__).resolve().parents[2]
+                / "data"
+                / "human"
+                / "human_joints_info.pkl"
+            )
         human_joints_info = torch.load(human_joints_info_path)
     J = human_joints_info["J"]
     parents_list = human_joints_info["parents_list"]

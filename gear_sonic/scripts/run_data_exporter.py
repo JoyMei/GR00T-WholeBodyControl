@@ -24,6 +24,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import signal
 import time
 
 import numpy as np
@@ -56,6 +57,17 @@ from gear_sonic.utils.teleop.revo2_data import (
     revo2_state_freshness,
     revo2_state_to_features,
 )
+
+
+def install_shutdown_signal_handlers() -> None:
+    """Make background exporter jobs run their normal KeyboardInterrupt cleanup."""
+
+    def request_shutdown(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -1049,6 +1061,12 @@ class GrootDataCollector:
                 self._state_subscriber.close()
             except Exception:
                 pass
+        image_subscriber = getattr(self, "_image_subscriber", None)
+        if image_subscriber is not None:
+            try:
+                image_subscriber.close()
+            except Exception:
+                pass
         for sock in [self._sonic_zmq_socket]:
             if sock is not None:
                 try:
@@ -1244,6 +1262,7 @@ def main(config: SonicDataExporterConfig):
 
 
 if __name__ == "__main__":
+    install_shutdown_signal_handlers()
     config = tyro.cli(SonicDataExporterConfig)
 
     if config.dataset_name is None:

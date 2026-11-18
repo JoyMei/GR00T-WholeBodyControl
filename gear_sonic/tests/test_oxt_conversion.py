@@ -50,6 +50,7 @@ def _mapping():
                 "output_key": "right_hand_joints",
                 "stream": "robot_state",
                 "value_path": ["right_hand_q_measured"],
+                "select_indices": [0, 1],
                 "dtype": "float32",
                 "shape": [2],
                 "max_age_ms": 60,
@@ -68,6 +69,7 @@ def _mapping():
                 "topic_prefix": "revo2_raw",
                 "items_path": ["samples"],
                 "value_path": ["sample", "pressure"],
+                "reshape": [1, 2],
                 "sample_time": {
                     "path": ["sample", "source_timestamp", "value"],
                     "unit": "ns",
@@ -245,6 +247,26 @@ class OxtConversionTest(unittest.TestCase):
                     replay_buffer_class=_FakeReplayBuffer,
                 )
             self.assertFalse(output.exists())
+
+    def test_field_selection_and_reshape_are_explicit(self):
+        mapping = _mapping()
+        mapping["fields"][1]["select_indices"] = [0]
+        mapping["fields"][1]["shape"] = [1]
+        mapping["fields"][3]["reshape"] = [1, 2]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session_root = _make_session(root / "dataset")
+            output = root / "candidate"
+            convert_session(
+                session_root,
+                mapping,
+                output,
+                root / "unused-oxt-qc",
+                replay_buffer_class=_FakeReplayBuffer,
+            )
+            episode = _FakeReplayBuffer.episodes[0]
+            self.assertEqual(episode["right_hand_joints"].shape[1:], (1,))
+            self.assertEqual(episode["right_tactile_data_fixture"].shape[1:], (1, 2))
 
     @unittest.skipUnless(os.environ.get("OXT_QC_ROOT"), "set OXT_QC_ROOT for integration test")
     def test_official_replay_buffer_and_oxt_qc_precheck(self):

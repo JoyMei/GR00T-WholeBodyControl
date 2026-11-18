@@ -11,7 +11,10 @@ from types import SimpleNamespace
 import numpy as np
 
 from gear_sonic.utils.data_collection.oxt_raw import OxtCaptureRuntime, OxtRawSession
-from gear_sonic.scripts.validate_oxt_raw import validate_session
+from gear_sonic.scripts.validate_oxt_raw import (
+    validate_capture_content,
+    validate_session,
+)
 from gear_sonic.utils.data_collection.oxt_raw import (
     _decode_robot_config,
     _decode_g1_robot_state_action,
@@ -20,6 +23,17 @@ from gear_sonic.utils.data_collection.oxt_raw import (
 
 
 class OxtRawSessionTest(unittest.TestCase):
+    def test_validator_reports_open_session_without_crashing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = OxtRawSession(temp_dir, session_id="open-session")
+            try:
+                valid, errors = validate_session(session.session_root)
+                self.assertFalse(valid)
+                self.assertIn("session status is 'open', expected 'closed'", errors)
+                self.assertIn("writer did not report a drained close", errors)
+            finally:
+                session.close()
+
     def test_session_writes_immutable_payloads_events_and_manifest(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             session = OxtRawSession(temp_dir, session_id="unit-test")
@@ -187,6 +201,47 @@ class OxtCaptureRuntimeTest(unittest.TestCase):
 
 
 class OxtRawValidationTest(unittest.TestCase):
+    def test_capture_validator_rejects_closed_session_without_episode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = OxtCaptureRuntime(
+                temp_dir, session_id="empty-capture", start_zmq=False
+            )
+            runtime.start()
+            path = runtime.close()
+
+            storage_valid, storage_errors = validate_session(path)
+            capture_valid, capture_errors = validate_capture_content(path)
+
+            self.assertTrue(storage_valid, storage_errors)
+            self.assertFalse(capture_valid)
+            self.assertIn("no completed OXT episode was recorded", capture_errors)
+            self.assertTrue(
+                any("g1_robot_state_action" in error for error in capture_errors)
+            )
+
+    def test_capture_validator_accepts_complete_core_stream_set(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = OxtCaptureRuntime(
+                temp_dir, session_id="complete-capture", start_zmq=False
+            )
+            runtime.start()
+            runtime.begin_episode(episode_index=0, task="test task")
+            runtime.capture_camera_message(
+                {"images": {"ego view": np.zeros((2, 3, 3), dtype=np.uint8)}}
+            )
+            for stream in (
+                "g1_robot_state_action",
+                "revo2_state_snapshot",
+                "revo2_native_sample_batch",
+                "robot_config_message",
+            ):
+                runtime.session.submit_stream(stream, {"sample": 1})
+            runtime.finish_episode("episode_complete", episode_index=0)
+            path = runtime.close()
+
+            capture_valid, capture_errors = validate_capture_content(path)
+            self.assertTrue(capture_valid, capture_errors)
+
     def test_validator_rejects_modified_control_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             session = OxtRawSession(temp_dir, session_id="tamper-test")

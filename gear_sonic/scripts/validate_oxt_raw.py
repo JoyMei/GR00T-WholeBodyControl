@@ -15,6 +15,15 @@ from pathlib import Path
 import sys
 
 
+REQUIRED_CAPTURE_STREAMS = (
+    "g1_robot_state_action",
+    "camera_ego_view_rgb",
+    "revo2_state_snapshot",
+    "revo2_native_sample_batch",
+    "robot_config_message",
+)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -44,7 +53,8 @@ def validate_session(session_root: Path) -> tuple[bool, list[str]]:
 
     if manifest.get("status") != "closed":
         errors.append(f"session status is {manifest.get('status')!r}, expected 'closed'")
-    if not manifest.get("close", {}).get("drained", False):
+    close_info = manifest.get("close")
+    if not isinstance(close_info, dict) or not close_info.get("drained", False):
         errors.append("writer did not report a drained close")
     if not manifest.get("storage_integrity_valid", False):
         errors.append("storage_integrity_valid is false")
@@ -213,11 +223,69 @@ def validate_session(session_root: Path) -> tuple[bool, list[str]]:
     return not errors, errors
 
 
+def validate_capture_content(session_root: Path) -> tuple[bool, list[str]]:
+    """Check that a storage-valid raw session contains a usable OXT pilot episode."""
+
+    errors: list[str] = []
+    session_root = session_root.expanduser().resolve()
+    manifest_path = session_root / "manifest.json"
+    events_path = session_root / "episode_events.jsonl"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, [f"cannot inspect capture manifest: {exc}"]
+
+    events: list[dict] = []
+    if events_path.is_file():
+        for line_number, line in enumerate(
+            events_path.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                errors.append(
+                    f"episode_events.jsonl:{line_number}: invalid JSON for capture audit: {exc}"
+                )
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+
+    completed_episode_ids = {
+        event.get("episode_id")
+        for event in events
+        if event.get("event") == "episode_complete" and event.get("episode_id")
+    }
+    if not completed_episode_ids:
+        errors.append("no completed OXT episode was recorded")
+
+    streams = manifest.get("streams")
+    if not isinstance(streams, dict):
+        streams = {}
+    for stream in REQUIRED_CAPTURE_STREAMS:
+        info = streams.get(stream)
+        records = int(info.get("records", 0)) if isinstance(info, dict) else 0
+        if records <= 0:
+            errors.append(f"required capture stream {stream!r} has no records")
+
+    metadata = manifest.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    raw_drop_messages = int(metadata.get("revo2_raw_drop_messages", 0) or 0)
+    if raw_drop_messages:
+        errors.append(f"revo2_raw_drop_messages={raw_drop_messages}")
+
+    return not errors, errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("session", type=Path, help="path to raw/<session-id>")
     args = parser.parse_args()
-    ok, errors = validate_session(args.session.expanduser().resolve())
+    storage_ok, storage_errors = validate_session(args.session.expanduser().resolve())
+    capture_ok, capture_errors = validate_capture_content(
+        args.session.expanduser().resolve()
+    )
+    errors = [*storage_errors, *capture_errors]
     session_root = args.session.expanduser().resolve()
     manifest_path = session_root / "manifest.json"
     manifest = {}
@@ -229,14 +297,15 @@ def main() -> int:
     print(
         json.dumps(
             {
-                "storage_valid": ok,
+                "storage_valid": storage_ok,
+                "capture_valid": storage_ok and capture_ok,
                 "oxt_submission_ready": manifest.get("oxt_submission_ready", False),
                 "errors": errors,
             },
             indent=2,
         )
     )
-    return 0 if ok else 1
+    return 0 if storage_ok and capture_ok else 1
 
 
 if __name__ == "__main__":
